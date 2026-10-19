@@ -33,8 +33,8 @@ jobs:
           flutter pub get
           find "$PUB_CACHE" android -name "build.gradle*" -exec sed -i -E 's/(compileSdkVersion|compileSdk)([[:space:]=(]+)3[0-5]/\1\236/g' {} +
 
-      - name: Build Release APK
-        run: flutter build apk --release
+      - name: Build Release APK (No R8 Shrinking to Preserve CameraX & MLKit)
+        run: flutter build apk --release --no-shrink
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4

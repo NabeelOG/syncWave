@@ -6,10 +6,25 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'clock_sync.dart';
 import 'ram_audio_source.dart';
+
+class DiscoveredHost {
+  final String hostName;
+  final String ip;
+  final int httpPort;
+  final int udpPort;
+
+  const DiscoveredHost({
+    required this.hostName,
+    required this.ip,
+    required this.httpPort,
+    required this.udpPort,
+  });
+}
 
 class ClientScreen extends StatefulWidget {
   final String deviceName;
@@ -23,15 +38,21 @@ class _ClientScreenState extends State<ClientScreen> {
   final AudioPlayer _player = AudioPlayer();
   final ClockSyncFilter _clockFilter = ClockSyncFilter();
   final TextEditingController _manualIpController = TextEditingController();
+  MobileScannerController? _scannerController;
+
+  bool _cameraPermissionGranted = false;
+  bool _checkingCamera = true;
 
   WebSocket? _ws;
   RawDatagramSocket? _udpSocket;
+  RawDatagramSocket? _discoverySocket;
   String? _hostIp;
   int _httpPort = 8080;
   int _udpPort = 8081;
 
   bool _connected = false;
   bool _connecting = false;
+  final Map<String, DiscoveredHost> _discoveredHosts = {};
 
   // Song State
   String _songTitle = 'Waiting for host to pick a song...';
@@ -47,12 +68,14 @@ class _ClientScreenState extends State<ClientScreen> {
 
   Timer? _syncTimer;
   Timer? _heartbeatTimer;
+  Timer? _discoveryProbeTimer;
   Timer? _scheduledStartTimer;
 
   @override
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    _initCameraAndDiscovery();
     _syncTimer = Timer.periodic(
       const Duration(milliseconds: 200),
       (_) => _keepInSync(),
@@ -63,19 +86,155 @@ class _ClientScreenState extends State<ClientScreen> {
     );
   }
 
+  Future<void> _initCameraAndDiscovery() async {
+    // 1. Start automatic Wi-Fi discovery immediately (even before camera opens)
+    _startWifiAutoDiscovery();
+
+    // 2. Request Camera permission explicitly so MobileScanner never starts black
+    final PermissionStatus status = await Permission.camera.request();
+    if (!mounted) return;
+
+    if (status.isGranted) {
+      _scannerController = MobileScannerController(
+        detectionSpeed: DetectionSpeed.normal,
+        facing: CameraFacing.back,
+      );
+      setState(() {
+        _cameraPermissionGranted = true;
+        _checkingCamera = false;
+      });
+    } else {
+      setState(() {
+        _cameraPermissionGranted = false;
+        _checkingCamera = false;
+      });
+    }
+  }
+
+  Future<void> _startWifiAutoDiscovery() async {
+    // A. Listen for UDP beacons from Host on port 8082
+    try {
+      _discoverySocket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        8082,
+        reuseAddress: true,
+      );
+      _discoverySocket!.broadcastEnabled = true;
+      _discoverySocket!.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read) {
+          final dg = _discoverySocket!.receive();
+          if (dg == null) return;
+          final String msg = utf8.decode(dg.data);
+          if (msg.startsWith('SYNCWAVE_HOST,')) {
+            final List<String> parts = msg.split(',');
+            if (parts.length >= 5) {
+              final String hostName = parts[1];
+              // Prefer the sender's actual UDP packet source IP if valid
+              final String senderIp = dg.address.address;
+              final String reportedIp = parts[2];
+              final String bestIp =
+                  (senderIp.isNotEmpty && senderIp != '0.0.0.0')
+                      ? senderIp
+                      : reportedIp;
+              final int httpP = int.tryParse(parts[3]) ?? 8080;
+              final int udpP = int.tryParse(parts[4]) ?? 8081;
+
+              if (mounted) {
+                setState(() {
+                  _discoveredHosts[bestIp] = DiscoveredHost(
+                    hostName: hostName,
+                    ip: bestIp,
+                    httpPort: httpP,
+                    udpPort: udpP,
+                  );
+                });
+              }
+            }
+          }
+        }
+      });
+
+      // Actively broadcast DISCOVER_SYNCWAVE probe every 2s
+      _discoveryProbeTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        if (_connected || _discoverySocket == null) return;
+        try {
+          _discoverySocket!.send(
+            utf8.encode('DISCOVER_SYNCWAVE'),
+            InternetAddress('255.255.255.255'),
+            8081,
+          );
+        } catch (_) {}
+      });
+    } catch (_) {}
+
+    // B. Fast parallel HTTP /24 subnet sweep (finds Host even if router blocks UDP broadcast)
+    _scanLocalSubnetForHost();
+  }
+
+  Future<void> _scanLocalSubnetForHost() async {
+    final String myIp = await detectLocalWifiIp();
+    final List<String> octets = myIp.split('.');
+    if (octets.length != 4) return;
+    final String prefix = '${octets[0]}.${octets[1]}.${octets[2]}';
+
+    // Also check common Android hotspot gateway IPs (192.168.43.1, 192.168.137.1)
+    final List<String> candidates = <String>[
+      '192.168.43.1',
+      '192.168.137.1',
+      for (int i = 1; i <= 254; i++) '$prefix.$i',
+    ];
+
+    const int batchSize = 35;
+    for (int i = 0; i < candidates.length; i += batchSize) {
+      if (!mounted || _connected) return;
+      final batch = candidates.skip(i).take(batchSize);
+      await Future.wait(batch.map(_probeHostHttp));
+    }
+  }
+
+  Future<void> _probeHostHttp(String ip) async {
+    final HttpClient client = HttpClient()
+      ..connectionTimeout = const Duration(milliseconds: 450);
+    try {
+      final HttpClientRequest req =
+          await client.getUrl(Uri.parse('http://$ip:8080/ping'));
+      final HttpClientResponse resp =
+          await req.close().timeout(const Duration(milliseconds: 500));
+      if (resp.statusCode == 200) {
+        final String body = await resp.transform(utf8.decoder).join();
+        final Map<String, dynamic> data =
+            jsonDecode(body) as Map<String, dynamic>;
+        if (data['app'] == 'syncwave' && mounted) {
+          setState(() {
+            _discoveredHosts[ip] = DiscoveredHost(
+              hostName: (data['hostName'] as String?) ?? 'Party Host',
+              ip: ip,
+              httpPort: (data['httpPort'] as num?)?.toInt() ?? 8080,
+              udpPort: (data['udpPort'] as num?)?.toInt() ?? 8081,
+            );
+          });
+        }
+      }
+    } catch (_) {
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   void _onQrDetected(BarcodeCapture capture) {
     if (_connected || _connecting) return;
     for (final barcode in capture.barcodes) {
       final String? raw = barcode.rawValue;
       if (raw == null) continue;
-      // Expected format: syncwave://<ip>:8080:8081
       if (raw.startsWith('syncwave://')) {
-        final String stripped = raw.replaceFirst('syncwave://', '');
+        final String stripped = raw.replaceFirst('syncwave://', '').trim();
         final List<String> parts = stripped.split(':');
         if (parts.isNotEmpty) {
           final String ip = parts[0];
-          final int httpP = parts.length > 1 ? (int.tryParse(parts[1]) ?? 8080) : 8080;
-          final int udpP = parts.length > 2 ? (int.tryParse(parts[2]) ?? 8081) : 8081;
+          final int httpP =
+              parts.length > 1 ? (int.tryParse(parts[1]) ?? 8080) : 8080;
+          final int udpP =
+              parts.length > 2 ? (int.tryParse(parts[2]) ?? 8081) : 8081;
           _connectToHost(ip, httpPort: httpP, udpPort: udpP);
           break;
         }
@@ -84,14 +243,27 @@ class _ClientScreenState extends State<ClientScreen> {
   }
 
   Future<void> _connectToHost(
-    String hostIp, {
+    String rawIpInput, {
     int httpPort = 8080,
     int udpPort = 8081,
   }) async {
-    if (_connecting || hostIp.isEmpty) return;
+    // Sanitize IP input (strip http://, ws://, :8080, slashes, whitespace)
+    String cleanIp = rawIpInput
+        .trim()
+        .replaceFirst(RegExp(r'^https?://'), '')
+        .replaceFirst(RegExp(r'^wss?://'), '')
+        .split('/')
+        .first;
+    if (cleanIp.contains(':')) {
+      final parts = cleanIp.split(':');
+      cleanIp = parts[0].trim();
+      httpPort = int.tryParse(parts[1].trim()) ?? httpPort;
+    }
+
+    if (_connecting || cleanIp.isEmpty) return;
     setState(() {
       _connecting = true;
-      _hostIp = hostIp;
+      _hostIp = cleanIp;
       _httpPort = httpPort;
       _udpPort = udpPort;
     });
@@ -99,7 +271,6 @@ class _ClientScreenState extends State<ClientScreen> {
     try {
       _clockFilter.reset();
 
-      // Bind UDP socket for silent background clock sync
       _udpSocket?.close();
       _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       _udpSocket!.listen((RawSocketEvent event) {
@@ -120,10 +291,12 @@ class _ClientScreenState extends State<ClientScreen> {
       });
 
       final WebSocket ws = await WebSocket.connect(
-        'ws://$hostIp:$httpPort/ws',
+        'ws://$cleanIp:$httpPort/ws',
       ).timeout(const Duration(seconds: 6));
 
       _ws = ws;
+      _scannerController?.stop();
+
       if (mounted) {
         setState(() {
           _connected = true;
@@ -137,8 +310,7 @@ class _ClientScreenState extends State<ClientScreen> {
         onError: (_) => _handleDisconnected(),
       );
 
-      // Run initial 25-probe clock sync burst silently
-      _runInitialSyncBurst(hostIp, udpPort);
+      _runInitialSyncBurst(cleanIp, udpPort);
       _sendStatusUpdate();
     } catch (e) {
       if (mounted) {
@@ -147,7 +319,11 @@ class _ClientScreenState extends State<ClientScreen> {
           _connected = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not connect to $hostIp')),
+          SnackBar(
+            content: Text(
+              'Could not reach $cleanIp. Make sure both phones are on the same Wi-Fi or Hotspot.',
+            ),
+          ),
         );
       }
     }
@@ -156,6 +332,7 @@ class _ClientScreenState extends State<ClientScreen> {
   void _handleDisconnected() {
     _scheduledStartTimer?.cancel();
     _player.stop();
+    _scannerController?.start();
     if (mounted) {
       setState(() {
         _connected = false;
@@ -167,15 +344,17 @@ class _ClientScreenState extends State<ClientScreen> {
   }
 
   Future<void> _runInitialSyncBurst(String hostIp, int udpPort) async {
-    final InternetAddress dest = InternetAddress(hostIp);
+    final InternetAddress? dest = InternetAddress.tryParse(hostIp);
     for (int i = 0; i < 25; i++) {
       if (!_connected) break;
       final double t1 = MonotonicClock.nowMs();
-      _udpSocket?.send(
-        utf8.encode('PING,${t1.toStringAsFixed(3)}'),
-        dest,
-        udpPort,
-      );
+      if (dest != null) {
+        _udpSocket?.send(
+          utf8.encode('PING,${t1.toStringAsFixed(3)}'),
+          dest,
+          udpPort,
+        );
+      }
       _ws?.add(jsonEncode({'type': 'SYNC_PING', 't1': t1}));
       await Future.delayed(const Duration(milliseconds: 25));
     }
@@ -184,13 +363,17 @@ class _ClientScreenState extends State<ClientScreen> {
   void _sendBackgroundSyncAndStatus() {
     if (!_connected || _hostIp == null) return;
     final double t1 = MonotonicClock.nowMs();
-    try {
-      _udpSocket?.send(
-        utf8.encode('PING,${t1.toStringAsFixed(3)}'),
-        InternetAddress(_hostIp!),
-        _udpPort,
-      );
-    } catch (_) {}
+    final InternetAddress? dest = InternetAddress.tryParse(_hostIp!);
+    if (dest != null) {
+      try {
+        _udpSocket?.send(
+          utf8.encode('PING,${t1.toStringAsFixed(3)}'),
+          dest,
+          _udpPort,
+        );
+      } catch (_) {}
+    }
+    _ws?.add(jsonEncode({'type': 'SYNC_PING', 't1': t1}));
     _sendStatusUpdate();
   }
 
@@ -202,8 +385,6 @@ class _ClientScreenState extends State<ClientScreen> {
         'name': widget.deviceName,
         'readyInRam': _readyInRam,
         'downloadPercent': _downloadPercent,
-        'rttMs': _clockFilter.minRttMs < 9000 ? _clockFilter.minRttMs : 0.0,
-        'driftMs': 0.0,
       }));
     } catch (_) {}
   }
@@ -224,14 +405,18 @@ class _ClientScreenState extends State<ClientScreen> {
         break;
 
       case 'LOAD_TRACK':
-        final String url = msg['url'] as String;
+        final String trackId = (msg['trackId'] as String?) ?? '';
+        // Always use the known working _hostIp to download the MP3
+        final String downloadUrl =
+            'http://$_hostIp:$_httpPort/track.mp3?id=$trackId';
         final String title = (msg['title'] as String?) ?? 'Shared Song';
         final int expectedSize = (msg['size'] as num?)?.toInt() ?? 0;
-        await _downloadSongIntoRam(url, title, expectedSize);
+        await _downloadSongIntoRam(downloadUrl, title, expectedSize);
         break;
 
       case 'PLAY_AT':
-        final double startServerMs = (msg['startServerTimeMs'] as num).toDouble();
+        final double startServerMs =
+            (msg['startServerTimeMs'] as num).toDouble();
         final double startPosSec = (msg['startTrackPosSec'] as num).toDouble();
         await _executeScheduledPlay(startServerMs, startPosSec);
         break;
@@ -246,8 +431,6 @@ class _ClientScreenState extends State<ClientScreen> {
     }
   }
 
-  /// Downloads the MP3 over local Wi-Fi directly into a [Uint8List] in RAM
-  /// and prepares the audio player for instant playback.
   Future<void> _downloadSongIntoRam(
     String url,
     String title,
@@ -376,9 +559,12 @@ class _ClientScreenState extends State<ClientScreen> {
   void dispose() {
     _syncTimer?.cancel();
     _heartbeatTimer?.cancel();
+    _discoveryProbeTimer?.cancel();
     _scheduledStartTimer?.cancel();
+    _scannerController?.dispose();
     _ws?.close();
     _udpSocket?.close();
+    _discoverySocket?.close();
     _manualIpController.dispose();
     _player.dispose();
     WakelockPlus.disable();
@@ -389,7 +575,7 @@ class _ClientScreenState extends State<ClientScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_connected ? 'Party Speaker' : 'Scan Host QR'),
+        title: Text(_connected ? 'Party Speaker' : 'Join Party'),
         centerTitle: true,
         backgroundColor: Colors.transparent,
         elevation: 0,
@@ -404,30 +590,111 @@ class _ClientScreenState extends State<ClientScreen> {
     return Padding(
       padding: const EdgeInsets.all(20),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text(
-            'Point camera at your friend\'s QR code',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 16),
+          // 1. Auto-Discovered Parties on Wi-Fi (One-Tap Join!)
+          if (_discoveredHosts.isNotEmpty) ...[
+            const Text(
+              'Parties Found on Wi-Fi (Tap to Join):',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF34D399),
+              ),
+            ),
+            const SizedBox(height: 8),
+            ..._discoveredHosts.values.map(
+              (h) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF10B981),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(
+                      vertical: 14,
+                      horizontal: 16,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: () => _connectToHost(
+                    h.ip,
+                    httpPort: h.httpPort,
+                    udpPort: h.udpPort,
+                  ),
+                  icon: const Icon(Icons.wifi_tethering_rounded),
+                  label: Text(
+                    'Join ${h.hostName} (${h.ip})',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // 2. Camera QR Scanner
           Expanded(
             child: ClipRRect(
               borderRadius: BorderRadius.circular(24),
               child: Stack(
                 alignment: Alignment.center,
                 children: [
-                  MobileScanner(onDetect: _onQrDetected),
-                  Container(
-                    width: 220,
-                    height: 220,
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: const Color(0xFF6366F1),
-                        width: 3,
+                  if (_checkingCamera)
+                    Container(
+                      color: const Color(0xFF151926),
+                      child: const Center(child: CircularProgressIndicator()),
+                    )
+                  else if (_cameraPermissionGranted &&
+                      _scannerController != null)
+                    MobileScanner(
+                      controller: _scannerController!,
+                      onDetect: _onQrDetected,
+                    )
+                  else
+                    Container(
+                      color: const Color(0xFF151926),
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.videocam_off_rounded,
+                            size: 48,
+                            color: Colors.white54,
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'Camera permission is needed to scan QR codes',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                          const SizedBox(height: 12),
+                          OutlinedButton(
+                            onPressed: () async {
+                              await openAppSettings();
+                            },
+                            child: const Text('Enable Camera Permission'),
+                          ),
+                        ],
                       ),
-                      borderRadius: BorderRadius.circular(20),
                     ),
-                  ),
+                  if (_cameraPermissionGranted)
+                    Container(
+                      width: 210,
+                      height: 210,
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: const Color(0xFF6366F1),
+                          width: 3,
+                        ),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                    ),
                   if (_connecting)
                     Container(
                       color: Colors.black54,
@@ -438,13 +705,16 @@ class _ClientScreenState extends State<ClientScreen> {
             ),
           ),
           const SizedBox(height: 16),
+
+          // 3. Manual IP Entry + Re-scan Wi-Fi button
           Row(
             children: [
               Expanded(
                 child: TextField(
                   controller: _manualIpController,
+                  keyboardType: TextInputType.url,
                   decoration: InputDecoration(
-                    hintText: 'Or enter Host IP (e.g. 192.168.1.5)',
+                    hintText: 'Host IP (shown under Host QR)',
                     filled: true,
                     fillColor: const Color(0xFF151926),
                     border: OutlineInputBorder(
@@ -458,7 +728,13 @@ class _ClientScreenState extends State<ClientScreen> {
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                tooltip: 'Search Wi-Fi for Party',
+                onPressed: _scanLocalSubnetForHost,
+                icon: const Icon(Icons.radar_rounded),
+              ),
+              const SizedBox(width: 8),
               FilledButton(
                 style: FilledButton.styleFrom(
                   backgroundColor: const Color(0xFF6366F1),
@@ -533,7 +809,7 @@ class _ClientScreenState extends State<ClientScreen> {
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Loading song into memory... $_downloadPercent%',
+                  'Loading song... $_downloadPercent%',
                   style: const TextStyle(color: Colors.white70, fontSize: 14),
                 ),
               ] else if (_readyInRam) ...[

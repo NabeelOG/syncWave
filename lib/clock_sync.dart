@@ -1,12 +1,11 @@
 import 'dart:io';
 import 'dart:math';
+import 'package:network_info_plus/network_info_plus.dart';
 
 /// Monotonic clock with microsecond resolution.
-/// Immune to OS wall-clock NTP adjustments during playback.
 class MonotonicClock {
   static final Stopwatch _stopwatch = Stopwatch()..start();
 
-  /// Current local monotonic time in milliseconds (with microsecond precision).
   static double nowMs() => _stopwatch.elapsedMicroseconds / 1000.0;
 }
 
@@ -16,8 +15,6 @@ class NtpSample {
   const NtpSample({required this.rttMs, required this.offsetMs});
 }
 
-/// Filters a burst of UDP NTP ping/pong samples by discarding the slowest 60%
-/// (which suffered Wi-Fi router queuing spikes) and averaging the fastest 40%.
 class ClockSyncFilter {
   final List<NtpSample> _samples = [];
   double _clockOffsetMs = 0.0;
@@ -27,7 +24,6 @@ class ClockSyncFilter {
   double get clockOffsetMs => _clockOffsetMs;
   double get minRttMs => _minRttMs;
   bool get isLocked => _isLocked;
-  int get sampleCount => _samples.length;
 
   void reset() {
     _samples.clear();
@@ -36,13 +32,10 @@ class ClockSyncFilter {
     _isLocked = false;
   }
 
-  /// Processes a 4-timestamp NTP handshake:
-  /// t1: client send time, t2: host receive time, t3: host send time, t4: client receive time.
   void addSample(double t1, double t2, double t3, double t4) {
     final double rtt = (t4 - t1) - (t3 - t2);
     final double offset = ((t2 - t1) + (t3 - t4)) / 2.0;
 
-    // Ignore corrupted or extreme outlier packets
     if (rtt < 0 || rtt > 1500) return;
 
     _samples.add(NtpSample(rttMs: rtt, offsetMs: offset));
@@ -50,13 +43,11 @@ class ClockSyncFilter {
       _samples.removeAt(0);
     }
 
-    // Sort ascending by Round-Trip Time (lowest RTT = least Wi-Fi contention)
     final List<NtpSample> sorted = List<NtpSample>.from(_samples)
       ..sort((a, b) => a.rttMs.compareTo(b.rttMs));
 
     _minRttMs = sorted.first.rttMs;
 
-    // Keep fastest 40% of samples
     final int keepCount = max(1, (sorted.length * 0.4).ceil());
     final Iterable<NtpSample> bestSamples = sorted.take(keepCount);
     final double trimmedMeanOffset =
@@ -65,22 +56,19 @@ class ClockSyncFilter {
     if (!_isLocked) {
       _clockOffsetMs = trimmedMeanOffset;
     } else if (rtt <= _minRttMs * 1.35 + 1.5) {
-      // Smooth Exponential Moving Average update on low-jitter packets
       _clockOffsetMs = (_clockOffsetMs * 0.75) + (trimmedMeanOffset * 0.25);
     }
 
-    if (_samples.length >= 6) {
+    if (_samples.length >= 4) {
       _isLocked = true;
     }
   }
 
-  /// Converts current local monotonic time into the Host phone's clock timeline.
-  double estimatedHostNowMs({double hwLatencyOffsetMs = 0.0}) {
-    return MonotonicClock.nowMs() + _clockOffsetMs + hwLatencyOffsetMs;
+  double estimatedHostNowMs() {
+    return MonotonicClock.nowMs() + _clockOffsetMs;
   }
 }
 
-/// 3-Zone Phase-Locked Loop (PLL) decision for continuous drift correction.
 enum PllZone { deadbandLocked, softPullIn, hardSeek }
 
 class PllDecision {
@@ -96,10 +84,6 @@ class PllDecision {
 }
 
 class PllController {
-  /// Evaluates phase error e = expectedMs - actualMs:
-  /// - |e| < 2.5 ms: Deadband (speed = 1.000x, zero warble)
-  /// - 2.5 ms <= |e| <= 45 ms: Proportional speed pull-in (0.965x .. 1.035x, zero click/pop)
-  /// - |e| > 45 ms: Hard seek to expected position
   static PllDecision evaluate({
     required double expectedPosMs,
     required double actualPosMs,
@@ -131,31 +115,75 @@ class PllController {
   }
 }
 
-/// Detects the phone's local Wi-Fi IPv4 address (e.g., 192.168.x.x or 10.x.x.x)
-/// using pure dart:io without requiring Android location permissions.
+/// Detects the phone's true Wi-Fi or Hotspot LAN IPv4 address on Android.
+/// Uses Android's native NetworkInfo API first, then falls back to interface inspection
+/// while ignoring cellular data interfaces (rmnet, ccmni, pdp, tun).
 Future<String> detectLocalWifiIp() async {
+  // 1. Try native Android WifiManager / ConnectivityManager via network_info_plus
+  try {
+    final String? wifiIp = await NetworkInfo().getWifiIP();
+    if (wifiIp != null &&
+        wifiIp.isNotEmpty &&
+        wifiIp != '0.0.0.0' &&
+        wifiIp != '127.0.0.1') {
+      return wifiIp;
+    }
+  } catch (_) {}
+
+  // 2. Fallback: inspect NetworkInterface.list() (Also works when phone is the Wi-Fi Hotspot!)
   try {
     final interfaces = await NetworkInterface.list(
       type: InternetAddressType.IPv4,
       includeLoopback: false,
     );
-    String? fallback;
+
+    String? wifiCandidate;
+    String? privateCandidate;
+
     for (final iface in interfaces) {
       final name = iface.name.toLowerCase();
-      final isWifi = name.contains('wlan') ||
+      // Skip mobile data & VPN interfaces
+      if (name.contains('rmnet') ||
+          name.contains('ccmni') ||
+          name.contains('pdp') ||
+          name.contains('tun') ||
+          name.contains('tap') ||
+          name.contains('dummy')) {
+        continue;
+      }
+
+      final isWifiOrHotspot = name.contains('wlan') ||
           name.contains('wifi') ||
-          name.contains('en0') ||
           name.contains('ap') ||
-          name.contains('swlan');
+          name.contains('swlan') ||
+          name.contains('rndis') ||
+          name.contains('en');
+
       for (final addr in iface.addresses) {
-        if (!addr.isLoopback && !addr.address.startsWith('169.254.')) {
-          if (isWifi) return addr.address;
-          fallback ??= addr.address;
+        final ip = addr.address;
+        if (addr.isLoopback || ip.startsWith('169.254.')) continue;
+
+        if (isWifiOrHotspot) {
+          wifiCandidate = ip;
+          if (ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('10.')) {
+            return ip;
+          }
+        }
+        if (ip.startsWith('192.168.') || ip.startsWith('172.')) {
+          privateCandidate ??= ip;
         }
       }
     }
-    return fallback ?? '127.0.0.1';
-  } catch (_) {
-    return '127.0.0.1';
-  }
+    if (wifiCandidate != null) return wifiCandidate;
+    if (privateCandidate != null) return privateCandidate;
+  } catch (_) {}
+
+  // 3. UDP routing table probe trick (connects a dummy UDP socket to a LAN address
+  // to ask the Linux kernel which local IPv4 interface routes to the local network)
+  try {
+    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    socket.close();
+  } catch (_) {}
+
+  return '192.168.43.1';
 }

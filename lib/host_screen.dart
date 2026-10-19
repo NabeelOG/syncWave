@@ -39,6 +39,7 @@ class HostScreen extends StatefulWidget {
 class _HostScreenState extends State<HostScreen> {
   static const int _httpPort = 8080;
   static const int _udpPort = 8081;
+  static const int _discoveryPort = 8082;
 
   final AudioPlayer _player = AudioPlayer();
   HttpServer? _httpServer;
@@ -47,6 +48,7 @@ class _HostScreenState extends State<HostScreen> {
 
   String _wifiIp = '';
   bool _serverReady = false;
+  String? _serverError;
 
   Uint8List? _mp3Bytes;
   String _songTitle = 'No song selected';
@@ -60,6 +62,7 @@ class _HostScreenState extends State<HostScreen> {
   double _currentRate = 1.0;
 
   Timer? _syncTimer;
+  Timer? _beaconTimer;
   Timer? _scheduledPlayTimer;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration?>? _durSub;
@@ -75,76 +78,147 @@ class _HostScreenState extends State<HostScreen> {
       if (mounted && dur != null) setState(() => _duration = dur);
     });
     _startServer();
-    // Silent background sync loop
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 200), (_) => _keepInSync());
+    _syncTimer = Timer.periodic(
+      const Duration(milliseconds: 200),
+      (_) => _keepInSync(),
+    );
   }
 
   Future<void> _startServer() async {
-    final ip = await detectLocalWifiIp();
-    if (mounted) setState(() => _wifiIp = ip);
+    try {
+      final String ip = await detectLocalWifiIp();
+      if (mounted) setState(() => _wifiIp = ip);
 
-    // Silent background UDP clock responder
-    _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, _udpPort);
-    _udpSocket!.listen((RawSocketEvent event) {
-      if (event == RawSocketEvent.read) {
-        final dg = _udpSocket!.receive();
-        if (dg == null) return;
-        final double t2 = MonotonicClock.nowMs();
-        final String msg = utf8.decode(dg.data);
-        if (msg.startsWith('PING,')) {
-          final String t1Str = msg.substring(5);
-          final String t3Str = MonotonicClock.nowMs().toStringAsFixed(3);
-          final List<int> reply =
-              utf8.encode('PONG,$t1Str,${t2.toStringAsFixed(3)},$t3Str');
-          _udpSocket!.send(reply, dg.address, dg.port);
+      // 1. Bind UDP Socket for clock sync & auto-discovery beacon
+      _udpSocket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        _udpPort,
+        reuseAddress: true,
+      );
+      _udpSocket!.broadcastEnabled = true;
+
+      _udpSocket!.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read) {
+          final dg = _udpSocket!.receive();
+          if (dg == null) return;
+          final double t2 = MonotonicClock.nowMs();
+          final String msg = utf8.decode(dg.data);
+          if (msg.startsWith('PING,')) {
+            final String t1Str = msg.substring(5);
+            final String t3Str = MonotonicClock.nowMs().toStringAsFixed(3);
+            final List<int> reply =
+                utf8.encode('PONG,$t1Str,${t2.toStringAsFixed(3)},$t3Str');
+            _udpSocket!.send(reply, dg.address, dg.port);
+          } else if (msg.startsWith('DISCOVER_SYNCWAVE')) {
+            final List<int> reply = utf8.encode(
+              'SYNCWAVE_HOST,${widget.deviceName},$_wifiIp,$_httpPort,$_udpPort',
+            );
+            _udpSocket!.send(reply, dg.address, dg.port);
+          }
         }
-      }
-    });
+      });
 
-    // HTTP + WebSocket Server for song sharing & play/pause commands
-    _httpServer = await HttpServer.bind(InternetAddress.anyIPv4, _httpPort);
-    if (mounted) setState(() => _serverReady = true);
-
-    _httpServer!.listen((HttpRequest req) async {
-      if (req.uri.path == '/ws' && WebSocketTransformer.isUpgradeRequest(req)) {
-        final WebSocket ws = await WebSocketTransformer.upgrade(req);
-        final String id = 'f_${DateTime.now().microsecondsSinceEpoch % 10000}';
-        final friend = ConnectedFriend(
-          id: id,
-          socket: ws,
-          name: 'Friend ${_friends.length + 1}',
+      // Broadcast party discovery beacon every 1s so friends see the party automatically
+      _beaconTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (_udpSocket == null || _wifiIp.isEmpty) return;
+        final List<int> packet = utf8.encode(
+          'SYNCWAVE_HOST,${widget.deviceName},$_wifiIp,$_httpPort,$_udpPort',
         );
-        if (mounted) setState(() => _friends[id] = friend);
+        try {
+          _udpSocket!.send(
+            packet,
+            InternetAddress('255.255.255.255'),
+            _discoveryPort,
+          );
+          final List<String> octets = _wifiIp.split('.');
+          if (octets.length == 4) {
+            final String subnetBroadcast =
+                '${octets[0]}.${octets[1]}.${octets[2]}.255';
+            _udpSocket!.send(
+              packet,
+              InternetAddress(subnetBroadcast),
+              _discoveryPort,
+            );
+          }
+        } catch (_) {}
+      });
 
-        if (_mp3Bytes != null) {
-          ws.add(jsonEncode({
-            'type': 'LOAD_TRACK',
-            'trackId': _trackId,
-            'title': _songTitle,
-            'size': _mp3Bytes!.length,
-            'url': 'http://$_wifiIp:$_httpPort/track.mp3?id=$_trackId',
+      // 2. Bind HTTP + WebSocket Server
+      _httpServer = await HttpServer.bind(
+        InternetAddress.anyIPv4,
+        _httpPort,
+        shared: true,
+      );
+      if (mounted) {
+        setState(() {
+          _serverReady = true;
+          _serverError = null;
+        });
+      }
+
+      _httpServer!.listen((HttpRequest req) async {
+        req.response.headers.add('Access-Control-Allow-Origin', '*');
+
+        if (req.uri.path == '/ping') {
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({
+            'app': 'syncwave',
+            'hostName': widget.deviceName,
+            'ip': _wifiIp,
+            'httpPort': _httpPort,
+            'udpPort': _udpPort,
           }));
+          await req.response.close();
+          return;
         }
 
-        ws.listen(
-          (dynamic data) => _onFriendMessage(friend, data as String),
-          onDone: () {
-            if (mounted) setState(() => _friends.remove(id));
-          },
-          onError: (_) {
-            if (mounted) setState(() => _friends.remove(id));
-          },
-        );
-      } else if (req.uri.path == '/track.mp3' && _mp3Bytes != null) {
-        req.response.headers.contentType = ContentType('audio', 'mpeg');
-        req.response.headers.contentLength = _mp3Bytes!.length;
-        req.response.add(_mp3Bytes!);
-        await req.response.close();
-      } else {
-        req.response.statusCode = HttpStatus.notFound;
-        await req.response.close();
+        if (req.uri.path == '/ws' && WebSocketTransformer.isUpgradeRequest(req)) {
+          final WebSocket ws = await WebSocketTransformer.upgrade(req);
+          final String id = 'f_${DateTime.now().microsecondsSinceEpoch % 10000}';
+          final friend = ConnectedFriend(
+            id: id,
+            socket: ws,
+            name: 'Friend ${_friends.length + 1}',
+          );
+          if (mounted) setState(() => _friends[id] = friend);
+
+          if (_mp3Bytes != null) {
+            // Use the IP the friend actually connected to so download URL always works!
+            final String hostHeader =
+                req.headers.value(HttpHeaders.hostHeader) ?? '$_wifiIp:$_httpPort';
+            ws.add(jsonEncode({
+              'type': 'LOAD_TRACK',
+              'trackId': _trackId,
+              'title': _songTitle,
+              'size': _mp3Bytes!.length,
+              'url': 'http://$hostHeader/track.mp3?id=$_trackId',
+            }));
+          }
+
+          ws.listen(
+            (dynamic data) => _onFriendMessage(friend, data as String),
+            onDone: () {
+              if (mounted) setState(() => _friends.remove(id));
+            },
+            onError: (_) {
+              if (mounted) setState(() => _friends.remove(id));
+            },
+          );
+        } else if (req.uri.path == '/track.mp3' && _mp3Bytes != null) {
+          req.response.headers.contentType = ContentType('audio', 'mpeg');
+          req.response.headers.contentLength = _mp3Bytes!.length;
+          req.response.add(_mp3Bytes!);
+          await req.response.close();
+        } else {
+          req.response.statusCode = HttpStatus.notFound;
+          await req.response.close();
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _serverError = e.toString());
       }
-    });
+    }
   }
 
   void _onFriendMessage(ConnectedFriend friend, String raw) {
@@ -269,7 +343,8 @@ class _HostScreenState extends State<HostScreen> {
 
   void _keepInSync() {
     if (!_isPlaying || !_player.playing) return;
-    final double elapsedSec = (MonotonicClock.nowMs() - _startHostTimeMs) / 1000.0;
+    final double elapsedSec =
+        (MonotonicClock.nowMs() - _startHostTimeMs) / 1000.0;
     if (elapsedSec < 0.25) return;
 
     final double expectedMs = (_startTrackPosSec + elapsedSec) * 1000.0;
@@ -300,6 +375,7 @@ class _HostScreenState extends State<HostScreen> {
   @override
   void dispose() {
     _syncTimer?.cancel();
+    _beaconTimer?.cancel();
     _scheduledPlayTimer?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
@@ -335,12 +411,12 @@ class _HostScreenState extends State<HostScreen> {
               child: Column(
                 children: [
                   const Text(
-                    'Scan to Join Party',
+                    'Scan or Tap to Join Party',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 6),
                   const Text(
-                    'Friends on the same Wi-Fi can scan this QR code',
+                    'Friends on the same Wi-Fi will see your party automatically or can scan this QR code',
                     style: TextStyle(fontSize: 13, color: Colors.white60),
                     textAlign: TextAlign.center,
                   ),
@@ -358,13 +434,42 @@ class _HostScreenState extends State<HostScreen> {
                             size: 180,
                             backgroundColor: Colors.white,
                           )
-                        : const SizedBox(
+                        : SizedBox(
                             width: 180,
                             height: 180,
-                            child: Center(child: CircularProgressIndicator()),
+                            child: Center(
+                              child: _serverError != null
+                                  ? Text(
+                                      _serverError!,
+                                      style: const TextStyle(
+                                        color: Colors.red,
+                                        fontSize: 12,
+                                      ),
+                                    )
+                                  : const CircularProgressIndicator(),
+                            ),
                           ),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E2436),
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                    child: Text(
+                      'Host IP: $_wifiIp',
+                      style: const TextStyle(
+                        color: Color(0xFF818CF8),
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
                   Text(
                     '${_friends.length} ${_friends.length == 1 ? "friend" : "friends"} connected',
                     style: const TextStyle(
@@ -479,11 +584,17 @@ class _HostScreenState extends State<HostScreen> {
                       children: [
                         Text(
                           _formatTime(_position),
-                          style: const TextStyle(fontSize: 12, color: Colors.white54),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white54,
+                          ),
                         ),
                         Text(
                           _formatTime(_duration),
-                          style: const TextStyle(fontSize: 12, color: Colors.white54),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white54,
+                          ),
                         ),
                       ],
                     ),
@@ -505,7 +616,9 @@ class _HostScreenState extends State<HostScreen> {
                           ? null
                           : () => _isPlaying ? _pauseAll() : _playAll(),
                       icon: Icon(
-                        _isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                        _isPlaying
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
                         size: 28,
                       ),
                       label: Text(
