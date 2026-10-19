@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -37,16 +38,16 @@ class HostScreen extends StatefulWidget {
 }
 
 class _HostScreenState extends State<HostScreen> {
-  static const int _httpPort = 8080;
+  static const int _defaultHttpPort = 8080;
   static const int _udpPort = 8081;
-  static const int _discoveryPort = 8082;
 
   final AudioPlayer _player = AudioPlayer();
   HttpServer? _httpServer;
   RawDatagramSocket? _udpSocket;
   final Map<String, ConnectedFriend> _friends = {};
 
-  String _wifiIp = '';
+  List<String> _hostIps = <String>[];
+  int _httpPort = _defaultHttpPort;
   bool _serverReady = false;
   String? _serverError;
 
@@ -86,10 +87,21 @@ class _HostScreenState extends State<HostScreen> {
 
   Future<void> _startServer() async {
     try {
-      final String ip = await detectLocalWifiIp();
-      if (mounted) setState(() => _wifiIp = ip);
+      // 1. Start the HTTP server immediately (do not wait for IP detection).
+      _httpServer = await HttpServer.bind(
+        InternetAddress.anyIPv4,
+        _defaultHttpPort,
+      );
+      _httpPort = _defaultHttpPort;
 
-      // 1. Bind UDP Socket for clock sync & auto-discovery beacon
+      if (mounted) setState(() => _serverReady = true);
+      _wireHttpHandler(_httpServer!);
+
+      // 2. Detect IP addresses and start discovery beacons.
+      final ips = await detectLanIps();
+      if (!mounted) return;
+      setState(() => _hostIps = ips);
+
       _udpSocket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
         _udpPort,
@@ -98,73 +110,75 @@ class _HostScreenState extends State<HostScreen> {
       _udpSocket!.broadcastEnabled = true;
 
       _udpSocket!.listen((RawSocketEvent event) {
-        if (event == RawSocketEvent.read) {
-          final dg = _udpSocket!.receive();
-          if (dg == null) return;
-          final double t2 = MonotonicClock.nowMs();
-          final String msg = utf8.decode(dg.data);
-          if (msg.startsWith('PING,')) {
-            final String t1Str = msg.substring(5);
-            final String t3Str = MonotonicClock.nowMs().toStringAsFixed(3);
-            final List<int> reply =
-                utf8.encode('PONG,$t1Str,${t2.toStringAsFixed(3)},$t3Str');
-            _udpSocket!.send(reply, dg.address, dg.port);
-          } else if (msg.startsWith('DISCOVER_SYNCWAVE')) {
-            final List<int> reply = utf8.encode(
-              'SYNCWAVE_HOST,${widget.deviceName},$_wifiIp,$_httpPort,$_udpPort',
-            );
-            _udpSocket!.send(reply, dg.address, dg.port);
-          }
+        if (event != RawSocketEvent.read) return;
+        final dg = _udpSocket!.receive();
+        if (dg == null) return;
+
+        final double t2 = MonotonicClock.nowMs();
+        final String msg = utf8.decode(dg.data, allowMalformed: true);
+
+        if (msg.startsWith('PING,')) {
+          final String t1Str = msg.substring(5);
+          final String t3Str = MonotonicClock.nowMs().toStringAsFixed(3);
+          final List<int> reply =
+              utf8.encode('PONG,$t1Str,${t2.toStringAsFixed(3)},$t3Str');
+          _udpSocket!.send(reply, dg.address, dg.port);
+        } else if (msg.startsWith('DISCOVER_SYNCWAVE')) {
+          _sendBeaconTo(dg.address, dg.port);
         }
       });
 
-      // Broadcast party discovery beacon every 1s so friends see the party automatically
       _beaconTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (_udpSocket == null || _wifiIp.isEmpty) return;
-        final List<int> packet = utf8.encode(
-          'SYNCWAVE_HOST,${widget.deviceName},$_wifiIp,$_httpPort,$_udpPort',
-        );
+        if (_udpSocket == null || _hostIps.isEmpty) return;
         try {
           _udpSocket!.send(
-            packet,
+            _beaconPacket(),
             InternetAddress('255.255.255.255'),
-            _discoveryPort,
+            8082,
           );
-          final List<String> octets = _wifiIp.split('.');
-          if (octets.length == 4) {
-            final String subnetBroadcast =
-                '${octets[0]}.${octets[1]}.${octets[2]}.255';
-            _udpSocket!.send(
-              packet,
-              InternetAddress(subnetBroadcast),
-              _discoveryPort,
-            );
+          for (final ip in _hostIps) {
+            final parts = ip.split('.');
+            if (parts.length == 4) {
+              _udpSocket!.send(
+                _beaconPacket(),
+                InternetAddress('${parts[0]}.${parts[1]}.${parts[2]}.255'),
+                8082,
+              );
+            }
           }
         } catch (_) {}
       });
+    } catch (e) {
+      if (mounted) setState(() => _serverError = e.toString());
+    }
+  }
 
-      // 2. Bind HTTP + WebSocket Server
-      _httpServer = await HttpServer.bind(
-        InternetAddress.anyIPv4,
-        _httpPort,
-        shared: true,
-      );
-      if (mounted) {
-        setState(() {
-          _serverReady = true;
-          _serverError = null;
-        });
-      }
+  List<int> _beaconPacket() {
+    return utf8.encode(
+      'SYNCWAVE_HOST,${widget.deviceName},'
+      '${_hostIps.isNotEmpty ? _hostIps.first : ''},'
+      '$_httpPort,$_udpPort',
+    );
+  }
 
-      _httpServer!.listen((HttpRequest req) async {
+  void _sendBeaconTo(InternetAddress address, int port) {
+    try {
+      _udpSocket?.send(_beaconPacket(), address, port);
+    } catch (_) {}
+  }
+
+  void _wireHttpHandler(HttpServer server) {
+    server.listen((HttpRequest req) async {
+      try {
         req.response.headers.add('Access-Control-Allow-Origin', '*');
+        req.response.headers.add('Access-Control-Allow-Headers', '*');
 
         if (req.uri.path == '/ping') {
           req.response.headers.contentType = ContentType.json;
           req.response.write(jsonEncode({
             'app': 'syncwave',
             'hostName': widget.deviceName,
-            'ip': _wifiIp,
+            'ip': _hostIps.isNotEmpty ? _hostIps.first : '',
             'httpPort': _httpPort,
             'udpPort': _udpPort,
           }));
@@ -172,9 +186,10 @@ class _HostScreenState extends State<HostScreen> {
           return;
         }
 
-        if (req.uri.path == '/ws' && WebSocketTransformer.isUpgradeRequest(req)) {
+        if (req.uri.path == '/ws' &&
+            WebSocketTransformer.isUpgradeRequest(req)) {
           final WebSocket ws = await WebSocketTransformer.upgrade(req);
-          final String id = 'f_${DateTime.now().microsecondsSinceEpoch % 10000}';
+          final String id = 'f_${DateTime.now().microsecondsSinceEpoch % 100000}';
           final friend = ConnectedFriend(
             id: id,
             socket: ws,
@@ -183,9 +198,9 @@ class _HostScreenState extends State<HostScreen> {
           if (mounted) setState(() => _friends[id] = friend);
 
           if (_mp3Bytes != null) {
-            // Use the IP the friend actually connected to so download URL always works!
             final String hostHeader =
-                req.headers.value(HttpHeaders.hostHeader) ?? '$_wifiIp:$_httpPort';
+                req.headers.value(HttpHeaders.hostHeader) ??
+                    '$_httpPort';
             ws.add(jsonEncode({
               'type': 'LOAD_TRACK',
               'trackId': _trackId,
@@ -204,21 +219,26 @@ class _HostScreenState extends State<HostScreen> {
               if (mounted) setState(() => _friends.remove(id));
             },
           );
-        } else if (req.uri.path == '/track.mp3' && _mp3Bytes != null) {
+          return;
+        }
+
+        if (req.uri.path == '/track.mp3' && _mp3Bytes != null) {
           req.response.headers.contentType = ContentType('audio', 'mpeg');
           req.response.headers.contentLength = _mp3Bytes!.length;
           req.response.add(_mp3Bytes!);
           await req.response.close();
-        } else {
-          req.response.statusCode = HttpStatus.notFound;
-          await req.response.close();
+          return;
         }
-      });
-    } catch (e) {
-      if (mounted) {
-        setState(() => _serverError = e.toString());
+
+        req.response.statusCode = HttpStatus.notFound;
+        await req.response.close();
+      } catch (_) {
+        try {
+          req.response.statusCode = HttpStatus.internalServerError;
+          await req.response.close();
+        } catch (_) {}
       }
-    }
+    });
   }
 
   void _onFriendMessage(ConnectedFriend friend, String raw) {
@@ -237,10 +257,13 @@ class _HostScreenState extends State<HostScreen> {
     } else if (type == 'PEER_STATUS') {
       if (mounted) {
         setState(() {
-          if (msg['name'] != null && (msg['name'] as String).trim().isNotEmpty) {
+          if (msg['name'] != null &&
+              (msg['name'] as String).trim().isNotEmpty) {
             friend.name = msg['name'] as String;
           }
-          if (msg['readyInRam'] != null) friend.ready = msg['readyInRam'] as bool;
+          if (msg['readyInRam'] != null) {
+            friend.ready = msg['readyInRam'] as bool;
+          }
           if (msg['downloadPercent'] != null) {
             friend.progress = (msg['downloadPercent'] as num).toInt();
           }
@@ -287,14 +310,20 @@ class _HostScreenState extends State<HostScreen> {
       }
     });
 
-    await _player.setAudioSource(RamAudioSource(bytes));
+    try {
+      await _player.setAudioSource(RamAudioSource(bytes));
+    } catch (_) {
+      try {
+        await _player.setFilePath(file.path!);
+      } catch (_) {}
+    }
 
     _broadcast({
       'type': 'LOAD_TRACK',
       'trackId': newId,
       'title': file.name,
       'size': bytes.length,
-      'url': 'http://$_wifiIp:$_httpPort/track.mp3?id=$newId',
+      'url': 'http://${_hostIps.isNotEmpty ? _hostIps.first : '0.0.0.0'}:$_httpPort/track.mp3?id=$newId',
     });
   }
 
@@ -388,7 +417,8 @@ class _HostScreenState extends State<HostScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final String qrData = 'syncwave://$_wifiIp:$_httpPort:$_udpPort';
+    final String primaryIp = _hostIps.isNotEmpty ? _hostIps.first : '';
+    final String qrData = 'syncwave://$primaryIp:$_httpPort:$_udpPort';
 
     return Scaffold(
       appBar: AppBar(
@@ -401,7 +431,6 @@ class _HostScreenState extends State<HostScreen> {
         child: ListView(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
           children: [
-            // QR Code Card
             Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
@@ -416,7 +445,7 @@ class _HostScreenState extends State<HostScreen> {
                   ),
                   const SizedBox(height: 6),
                   const Text(
-                    'Friends on the same Wi-Fi will see your party automatically or can scan this QR code',
+                    'Friends open SyncWave → Join a Party. Your party appears automatically on the same Wi-Fi.',
                     style: TextStyle(fontSize: 13, color: Colors.white60),
                     textAlign: TextAlign.center,
                   ),
@@ -427,48 +456,87 @@ class _HostScreenState extends State<HostScreen> {
                       color: Colors.white,
                       borderRadius: BorderRadius.circular(16),
                     ),
-                    child: _serverReady
+                    child: _serverReady && primaryIp.isNotEmpty
                         ? QrImageView(
                             data: qrData,
                             version: QrVersions.auto,
-                            size: 180,
+                            size: 170,
                             backgroundColor: Colors.white,
                           )
                         : SizedBox(
-                            width: 180,
-                            height: 180,
+                            width: 170,
+                            height: 170,
                             child: Center(
                               child: _serverError != null
                                   ? Text(
-                                      _serverError!,
+                                      'Server error:\n$_serverError',
                                       style: const TextStyle(
                                         color: Colors.red,
-                                        fontSize: 12,
+                                        fontSize: 11,
                                       ),
+                                      textAlign: TextAlign.center,
                                     )
                                   : const CircularProgressIndicator(),
                             ),
                           ),
                   ),
                   const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1E2436),
-                      borderRadius: BorderRadius.circular(99),
-                    ),
-                    child: Text(
-                      'Host IP: $_wifiIp',
-                      style: const TextStyle(
-                        color: Color(0xFF818CF8),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
+                  if (primaryIp.isNotEmpty)
+                    InkWell(
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(
+                          text: '$primaryIp:$_httpPort',
+                        ));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Host IP copied'),
+                            duration: Duration(seconds: 1),
+                          ),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1E2436),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          children: [
+                            Text(
+                              'Host IP: $primaryIp',
+                              style: const TextStyle(
+                                color: Color(0xFF818CF8),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 17,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            const Text(
+                              'Tap to copy — share with friends',
+                              style: TextStyle(
+                                color: Colors.white38,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
+                  if (_hostIps.length > 1) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Other addresses: ${_hostIps.skip(1).join(', ')}',
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 11,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
                   const SizedBox(height: 10),
                   Text(
                     '${_friends.length} ${_friends.length == 1 ? "friend" : "friends"} connected',
@@ -507,7 +575,6 @@ class _HostScreenState extends State<HostScreen> {
 
             const SizedBox(height: 20),
 
-            // Music Player Card
             Container(
               padding: const EdgeInsets.all(22),
               decoration: BoxDecoration(
@@ -556,8 +623,6 @@ class _HostScreenState extends State<HostScreen> {
                     label: const Text('Choose MP3 from Phone'),
                   ),
                   const SizedBox(height: 20),
-
-                  // Progress slider
                   Slider(
                     value: _position.inMilliseconds
                         .toDouble()
@@ -600,8 +665,6 @@ class _HostScreenState extends State<HostScreen> {
                     ),
                   ),
                   const SizedBox(height: 16),
-
-                  // Big Play / Pause Button
                   SizedBox(
                     width: double.infinity,
                     height: 56,
@@ -631,6 +694,17 @@ class _HostScreenState extends State<HostScreen> {
                     ),
                   ),
                 ],
+              ),
+            ),
+
+            const SizedBox(height: 14),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                'Tip: If friends cannot find you, turn on your phone\'s Personal Hotspot and ask them to join it. '
+                'Some Wi-Fi networks block phone-to-phone connections.',
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+                textAlign: TextAlign.center,
               ),
             ),
           ],

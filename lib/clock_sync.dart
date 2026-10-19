@@ -1,6 +1,5 @@
 import 'dart:io';
 import 'dart:math';
-import 'package:network_info_plus/network_info_plus.dart';
 
 /// Monotonic clock with microsecond resolution.
 class MonotonicClock {
@@ -115,75 +114,59 @@ class PllController {
   }
 }
 
-/// Detects the phone's true Wi-Fi or Hotspot LAN IPv4 address on Android.
-/// Uses Android's native NetworkInfo API first, then falls back to interface inspection
-/// while ignoring cellular data interfaces (rmnet, ccmni, pdp, tun).
-Future<String> detectLocalWifiIp() async {
-  // 1. Try native Android WifiManager / ConnectivityManager via network_info_plus
-  try {
-    final String? wifiIp = await NetworkInfo().getWifiIP();
-    if (wifiIp != null &&
-        wifiIp.isNotEmpty &&
-        wifiIp != '0.0.0.0' &&
-        wifiIp != '127.0.0.1') {
-      return wifiIp;
-    }
-  } catch (_) {}
+/// Returns every usable LAN IPv4 address on this phone, ordered by usefulness.
+/// Pure dart:io so there are no extra Android permissions or plugins involved.
+Future<List<String>> detectLanIps() async {
+  final List<String> wifi = <String>[];
+  final List<String> other = <String>[];
 
-  // 2. Fallback: inspect NetworkInterface.list() (Also works when phone is the Wi-Fi Hotspot!)
   try {
     final interfaces = await NetworkInterface.list(
       type: InternetAddressType.IPv4,
       includeLoopback: false,
     );
 
-    String? wifiCandidate;
-    String? privateCandidate;
-
     for (final iface in interfaces) {
       final name = iface.name.toLowerCase();
-      // Skip mobile data & VPN interfaces
+
+      // Ignore mobile data, VPN, and virtual tunnels
       if (name.contains('rmnet') ||
           name.contains('ccmni') ||
           name.contains('pdp') ||
+          name.contains('clat') ||
           name.contains('tun') ||
           name.contains('tap') ||
-          name.contains('dummy')) {
+          name.contains('dummy') ||
+          name.contains('veth')) {
         continue;
       }
 
-      final isWifiOrHotspot = name.contains('wlan') ||
+      final isWifiLike = name.contains('wlan') ||
           name.contains('wifi') ||
           name.contains('ap') ||
           name.contains('swlan') ||
+          name.contains('eth') ||
           name.contains('rndis') ||
-          name.contains('en');
+          name.contains('p2p');
 
       for (final addr in iface.addresses) {
-        final ip = addr.address;
+        final String ip = addr.address;
         if (addr.isLoopback || ip.startsWith('169.254.')) continue;
 
-        if (isWifiOrHotspot) {
-          wifiCandidate = ip;
-          if (ip.startsWith('192.168.') || ip.startsWith('172.') || ip.startsWith('10.')) {
-            return ip;
-          }
-        }
-        if (ip.startsWith('192.168.') || ip.startsWith('172.')) {
-          privateCandidate ??= ip;
+        if (isWifiLike) {
+          if (!wifi.contains(ip)) wifi.add(ip);
+        } else {
+          if (!other.contains(ip)) other.add(ip);
         }
       }
     }
-    if (wifiCandidate != null) return wifiCandidate;
-    if (privateCandidate != null) return privateCandidate;
   } catch (_) {}
 
-  // 3. UDP routing table probe trick (connects a dummy UDP socket to a LAN address
-  // to ask the Linux kernel which local IPv4 interface routes to the local network)
-  try {
-    final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-    socket.close();
-  } catch (_) {}
+  final List<String> result = [...wifi, ...other];
 
-  return '192.168.43.1';
+  // Most common phone hotspot gateways (Android / iPhone / Windows) as last resort
+  if (result.isEmpty) {
+    result.addAll(const ['192.168.43.1', '192.168.137.1', '172.20.10.1']);
+  }
+  return result;
 }
