@@ -6,7 +6,6 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'clock_sync.dart';
@@ -40,12 +39,10 @@ class _ClientScreenState extends State<ClientScreen> {
   final AudioPlayer _player = AudioPlayer();
   final ClockSyncFilter _clockFilter = ClockSyncFilter();
   final TextEditingController _manualController = TextEditingController();
-  MobileScannerController? _scannerController;
-
-  bool _cameraGranted = false;
-  bool _checkingCamera = true;
-  bool _showScanner = false;
-  String? _scannerError;
+  final MobileScannerController _scannerController = MobileScannerController(
+    detectionSpeed: DetectionSpeed.noDuplicates,
+    facing: CameraFacing.back,
+  );
 
   WebSocket? _ws;
   RawDatagramSocket? _udpSocket;
@@ -99,26 +96,6 @@ class _ClientScreenState extends State<ClientScreen> {
 
     await _startDiscovery();
     _sweepSubnet();
-
-    final status = await Permission.camera.request();
-    if (!mounted) return;
-    if (status.isGranted) {
-      _scannerController = MobileScannerController(
-        detectionSpeed: DetectionSpeed.noDuplicates,
-        facing: CameraFacing.back,
-      );
-      setState(() {
-        _cameraGranted = true;
-        _checkingCamera = false;
-        _showScanner = true;
-      });
-    } else {
-      setState(() {
-        _cameraGranted = false;
-        _checkingCamera = false;
-        _showScanner = false;
-      });
-    }
   }
 
   Future<void> _startDiscovery() async {
@@ -348,7 +325,7 @@ class _ClientScreenState extends State<ClientScreen> {
       _ws = ws;
 
       try {
-        await _scannerController?.stop();
+        await _scannerController.stop();
       } catch (_) {}
 
       if (mounted) {
@@ -382,7 +359,7 @@ class _ClientScreenState extends State<ClientScreen> {
     _scheduledStartTimer?.cancel();
     _player.stop();
     try {
-      _scannerController?.start();
+      _scannerController.start();
     } catch (_) {}
     if (mounted) {
       setState(() {
@@ -611,7 +588,7 @@ class _ClientScreenState extends State<ClientScreen> {
     _probeTimer?.cancel();
     _sweepTimer?.cancel();
     _scheduledStartTimer?.cancel();
-    _scannerController?.dispose();
+    _scannerController.dispose();
     _ws?.close();
     _udpSocket?.close();
     _discoverySocket?.close();
@@ -723,82 +700,55 @@ class _ClientScreenState extends State<ClientScreen> {
           const SizedBox(height: 16),
         ],
 
-        if (_showScanner && _cameraGranted)
-          Container(
-            height: 260,
-            clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(
-              color: const Color(0xFF151926),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                MobileScanner(
-                  controller: _scannerController,
-                  onDetect: _onQrDetected,
-                  errorBuilder: (context, error) {
-                    return Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Text(
-                          'Camera unavailable: ${error.errorDetails?.message ?? error.errorCode.name}',
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white54,
-                            fontSize: 12,
-                          ),
+        Container(
+          height: 250,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: const Color(0xFF151926),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              MobileScanner(
+                controller: _scannerController,
+                onDetect: _onQrDetected,
+                errorBuilder: (context, error) {
+                  final code = error.errorCode.name;
+                  final friendly = code.contains('PERMISSION')
+                      ? 'Allow camera access to scan the QR code.'
+                      : 'Camera unavailable ($code). Use the party list above or type the Host IP below.';
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Text(
+                        friendly,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white54,
+                          fontSize: 13,
                         ),
                       ),
-                    );
-                  },
-                ),
-                IgnorePointer(
-                  child: Container(
-                    width: 160,
-                    height: 160,
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: const Color(0xFF6366F1),
-                        width: 3,
-                      ),
-                      borderRadius: BorderRadius.circular(16),
                     ),
+                  );
+                },
+              ),
+              IgnorePointer(
+                child: Container(
+                  width: 160,
+                  height: 160,
+                  decoration: BoxDecoration(
+                    border: Border.all(
+                      color: const Color(0xFF6366F1),
+                      width: 3,
+                    ),
+                    borderRadius: BorderRadius.circular(16),
                   ),
                 ),
-              ],
-            ),
-          )
-        else if (!_checkingCamera)
-          Container(
-            padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              color: const Color(0xFF151926),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Column(
-              children: [
-                const Icon(
-                  Icons.videocam_off_rounded,
-                  size: 34,
-                  color: Colors.white38,
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Camera not available — no problem. Use the party list above or type the Host IP below.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Colors.white54),
-                ),
-                const SizedBox(height: 8),
-                TextButton(
-                  onPressed: () async {
-                    await openAppSettings();
-                  },
-                  child: const Text('Open App Permissions'),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
+        ),
 
         const SizedBox(height: 16),
         const Text(

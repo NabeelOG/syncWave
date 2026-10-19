@@ -163,10 +163,5 @@ Future<List<String>> detectLanIps() async {
   } catch (_) {}
 
   final List<String> result = [...wifi, ...other];
-
-  // Most common phone hotspot gateways (Android / iPhone / Windows) as last resort
-  if (result.isEmpty) {
-    result.addAll(const ['192.168.43.1', '192.168.137.1', '172.20.10.1']);
-  }
   return result;
 }

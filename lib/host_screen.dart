@@ -282,19 +282,28 @@ class _HostScreenState extends State<HostScreen> {
   }
 
   Future<void> _pickSong() async {
-    final FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['mp3', 'wav', 'm4a', 'aac'],
-      withData: true,
-    );
-    if (result == null || result.files.isEmpty) return;
-
-    final PlatformFile file = result.files.first;
-    Uint8List? bytes = file.bytes;
-    if (bytes == null && file.path != null) {
-      bytes = await File(file.path!).readAsBytes();
+    PlatformFile? picked;
+    try {
+      picked = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['mp3', 'wav', 'm4a', 'aac'],
+      );
+    } catch (_) {
+      picked = null;
     }
-    if (bytes == null || bytes.isEmpty) return;
+    if (picked == null) return;
+
+    final PlatformFile chosen = picked;
+    final String fileName = chosen.name;
+    final String? localPath = chosen.path;
+
+    Uint8List bytes;
+    try {
+      bytes = await chosen.readAsBytes();
+    } catch (_) {
+      return;
+    }
+    if (bytes.isEmpty) return;
 
     await _player.stop();
     final String newId = 'song_${DateTime.now().millisecondsSinceEpoch}';
@@ -302,7 +311,7 @@ class _HostScreenState extends State<HostScreen> {
     setState(() {
       _isPlaying = false;
       _mp3Bytes = bytes;
-      _songTitle = file.name;
+      _songTitle = fileName;
       _trackId = newId;
       for (final f in _friends.values) {
         f.ready = false;
@@ -313,15 +322,17 @@ class _HostScreenState extends State<HostScreen> {
     try {
       await _player.setAudioSource(RamAudioSource(bytes));
     } catch (_) {
-      try {
-        await _player.setFilePath(file.path!);
-      } catch (_) {}
+      if (localPath != null) {
+        try {
+          await _player.setFilePath(localPath);
+        } catch (_) {}
+      }
     }
 
     _broadcast({
       'type': 'LOAD_TRACK',
       'trackId': newId,
-      'title': file.name,
+      'title': fileName,
       'size': bytes.length,
       'url': 'http://${_hostIps.isNotEmpty ? _hostIps.first : '0.0.0.0'}:$_httpPort/track.mp3?id=$newId',
     });
