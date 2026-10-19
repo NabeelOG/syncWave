@@ -17,11 +17,13 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+          cache: true
 
       - name: Generate Android Platform Files & Restore Custom Manifest
         run: |
@@ -30,6 +32,7 @@ jobs:
           flutter create --platforms=android --project-name syncwave .
           cp /tmp/CustomAndroidManifest.xml android/app/src/main/AndroidManifest.xml
           flutter pub get
+          find "$PUB_CACHE" android -name "build.gradle*" -exec sed -i -E 's/(compileSdkVersion|compileSdk)([[:space:]=(]+)3[0-5]/\1\236/g' {} +
 
       - name: Build Release APK
         run: flutter build apk --release
