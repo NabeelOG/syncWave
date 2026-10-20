@@ -1,7 +1,7 @@
 name: syncwave
-description: Multi-phone Wi-Fi synchronized MP3 player (Host & Client with in-RAM pre-buffering).
+description: Play one MP3 on many phones at the same time over Wi-Fi.
 publish_to: "none"
-version: 1.0.2+3
+version: 2.0.0+4
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
@@ -13,7 +13,6 @@ dependencies:
   audio_session: ^0.2.4
   file_picker: ^13.1.0
   qr_flutter: ^4.1.0
-  mobile_scanner: ^7.4.2
   wakelock_plus: ^1.8.1
 
 dev_dependencies:

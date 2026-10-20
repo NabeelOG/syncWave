@@ -1,10 +1,9 @@
-import 'dart:math';
-
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
 
-import 'client_screen.dart';
-import 'host_screen.dart';
+import 'client.dart';
+import 'host.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -28,32 +27,65 @@ class SyncWaveApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: const RoleSelectScreen(),
+      home: const HomeScreen(),
     );
   }
 }
 
-class RoleSelectScreen extends StatefulWidget {
-  const RoleSelectScreen({super.key});
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
 
   @override
-  State<RoleSelectScreen> createState() => _RoleSelectScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _RoleSelectScreenState extends State<RoleSelectScreen> {
-  late final TextEditingController _nameController;
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  final TextEditingController _name =
+      TextEditingController(text: 'Phone ${100 + DateTime.now().millisecond % 900}');
 
   @override
   void initState() {
     super.initState();
-    final int suffix = 100 + Random().nextInt(900);
-    _nameController = TextEditingController(text: 'Phone $suffix');
+    WidgetsBinding.instance.addObserver(this);
+    final ip = _ipFromRoute(
+      WidgetsBinding.instance.platformDispatcher.defaultRouteName,
+    );
+    if (ip != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openClient(ip));
+    }
   }
 
   @override
   void dispose() {
-    _nameController.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _name.dispose();
     super.dispose();
+  }
+
+  @override
+  void didPushRoute(Route<dynamic> route) {
+    final ip = _ipFromRoute(route.settings.name ?? '');
+    if (ip != null) _openClient(ip);
+  }
+
+  /// Extracts the host IP from a `syncwave://join?ip=1.2.3.4` link.
+  String? _ipFromRoute(String route) {
+    if (!route.startsWith('syncwave://')) return null;
+    final uri = Uri.tryParse(route);
+    final ip = uri?.queryParameters['ip'];
+    if (ip == null || ip.isEmpty) return null;
+    return ip;
+  }
+
+  void _openClient(String ip) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ClientScreen(
+          deviceName: _name.text.trim().isEmpty ? 'Friend' : _name.text.trim(),
+          autoJoinIp: ip,
+        ),
+      ),
+    );
   }
 
   @override
@@ -61,29 +93,24 @@ class _RoleSelectScreenState extends State<RoleSelectScreen> {
     return Scaffold(
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(28),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // App Icon & Title
-              Center(
-                child: Container(
-                  width: 76,
-                  height: 76,
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF6366F1), Color(0xFF10B981)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(22),
+              Container(
+                width: 78,
+                height: 78,
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF6366F1), Color(0xFF10B981)],
                   ),
-                  child: const Icon(
-                    Icons.speaker_group_rounded,
-                    size: 40,
-                    color: Colors.white,
-                  ),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Icon(
+                  Icons.speaker_group_rounded,
+                  size: 42,
+                  color: Colors.white,
                 ),
               ),
               const SizedBox(height: 20),
@@ -91,22 +118,19 @@ class _RoleSelectScreenState extends State<RoleSelectScreen> {
                 'SyncWave',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 30,
+                  fontSize: 32,
                   fontWeight: FontWeight.w800,
-                  letterSpacing: -0.5,
                 ),
               ),
               const SizedBox(height: 8),
               const Text(
-                'Play music together across multiple phones on Wi-Fi.',
+                'Play one song on every phone at the same time.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 15, color: Colors.white60),
               ),
-              const SizedBox(height: 36),
-
-              // Nickname Input
+              const SizedBox(height: 34),
               TextField(
-                controller: _nameController,
+                controller: _name,
                 decoration: InputDecoration(
                   labelText: 'Your Name',
                   prefixIcon: const Icon(Icons.person_outline_rounded),
@@ -118,11 +142,9 @@ class _RoleSelectScreenState extends State<RoleSelectScreen> {
                   ),
                 ),
               ),
-              const SizedBox(height: 24),
-
-              // Host Button
+              const SizedBox(height: 20),
               SizedBox(
-                height: 62,
+                height: 60,
                 child: FilledButton.icon(
                   style: FilledButton.styleFrom(
                     backgroundColor: const Color(0xFF6366F1),
@@ -134,25 +156,23 @@ class _RoleSelectScreenState extends State<RoleSelectScreen> {
                     Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => HostScreen(
-                          deviceName: _nameController.text.trim().isEmpty
+                          deviceName: _name.text.trim().isEmpty
                               ? 'Host'
-                              : _nameController.text.trim(),
+                              : _name.text.trim(),
                         ),
                       ),
                     );
                   },
-                  icon: const Icon(Icons.qr_code_2_rounded, size: 28),
+                  icon: const Icon(Icons.qr_code_2_rounded, size: 26),
                   label: const Text(
-                    'Host a Party (Show QR & Pick MP3)',
+                    'Host a Party',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
               ),
-              const SizedBox(height: 14),
-
-              // Join Button
+              const SizedBox(height: 12),
               SizedBox(
-                height: 62,
+                height: 60,
                 child: OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
                     backgroundColor: const Color(0xFF151926),
@@ -165,16 +185,16 @@ class _RoleSelectScreenState extends State<RoleSelectScreen> {
                     Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => ClientScreen(
-                          deviceName: _nameController.text.trim().isEmpty
+                          deviceName: _name.text.trim().isEmpty
                               ? 'Friend'
-                              : _nameController.text.trim(),
+                              : _name.text.trim(),
                         ),
                       ),
                     );
                   },
-                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 26),
+                  icon: const Icon(Icons.group_rounded, size: 26),
                   label: const Text(
-                    'Join a Party (Scan QR)',
+                    'Join a Party',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
