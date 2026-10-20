@@ -10,6 +10,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'device_audio.dart';
 import 'lan.dart';
 import 'ram_source.dart';
 import 'sync.dart';
@@ -56,6 +57,11 @@ class _HostScreenState extends State<HostScreen> {
   double _speed = 1.0;
   double _lastSeekAtMs = 0;
 
+  // Estimated latency between the player emitting a sample and the sound
+  // leaving this phone's speaker. Clients use it together with their own value
+  // to line the two phones up.
+  double _outputLatencyMs = 0;
+
   Timer? _pll;
   Timer? _startTimer;
   StreamSubscription<Duration>? _posSub;
@@ -80,6 +86,7 @@ class _HostScreenState extends State<HostScreen> {
 
   Future<void> _start() async {
     try {
+      _outputLatencyMs = await DeviceAudio.outputLatencyMs();
       final server = await HttpServer.bind(InternetAddress.anyIPv4, kPort);
       _server = server;
       server.listen(_handleRequest);
@@ -106,6 +113,7 @@ class _HostScreenState extends State<HostScreen> {
         'name': widget.deviceName,
         'ip': _hostIp,
         'port': kPort,
+        'latencyMs': _outputLatencyMs,
       }));
       await req.response.close();
       return;
@@ -288,6 +296,7 @@ class _HostScreenState extends State<HostScreen> {
       'type': 'play',
       'startAtMs': startAt,
       'startPosSec': pos,
+      'latencyMs': _outputLatencyMs,
     });
 
     _startTimer?.cancel();

@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'device_audio.dart';
 import 'lan.dart';
 import 'ram_source.dart';
 import 'sync.dart';
@@ -58,6 +59,15 @@ class _ClientScreenState extends State<ClientScreen> {
   // Timestamp of the last hard seek, used to rate-limit audible corrections.
   double _lastSeekAtMs = 0;
 
+  /// How much earlier this phone must start than the host so that the sound
+  /// leaves both speakers at the same moment:
+  ///   (my output latency - host output latency) + manual nudge
+  /// Positive = this phone starts earlier.
+  double _latencyOffsetMs = 0;
+  double _myLatencyMs = 0;
+  double _hostLatencyMs = 0;
+  int _nudgeMs = 0;
+
   Timer? _pll;
   Timer? _keepAlive;
   Timer? _startTimer;
@@ -67,8 +77,9 @@ class _ClientScreenState extends State<ClientScreen> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    _loadDeviceAudio();
     _pll = Timer.periodic(
-      const Duration(milliseconds: 250),
+      const Duration(milliseconds: 200),
       (_) => _tick(),
     );
 
@@ -79,6 +90,19 @@ class _ClientScreenState extends State<ClientScreen> {
     } else {
       _search();
     }
+  }
+
+  /// Reads this phone's output latency and the saved manual nudge.
+  Future<void> _loadDeviceAudio() async {
+    _myLatencyMs = await DeviceAudio.outputLatencyMs();
+    _nudgeMs = await DeviceAudio.nudgeMs();
+    if (mounted) {
+      setState(() => _recomputeLatencyOffset());
+    }
+  }
+
+  void _recomputeLatencyOffset() {
+    _latencyOffsetMs = (_myLatencyMs - _hostLatencyMs) + _nudgeMs.toDouble();
   }
 
   Future<void> _search() async {
@@ -123,6 +147,8 @@ class _ClientScreenState extends State<ClientScreen> {
         throw const FormatException('not a SyncWave host');
       }
       _hostPort = (data['port'] as num?)?.toInt() ?? 8080;
+      _hostLatencyMs = (data['latencyMs'] as num?)?.toDouble() ?? 0.0;
+      _recomputeLatencyOffset();
     } catch (e) {
       client.close(force: true);
       if (mounted) {
@@ -206,6 +232,10 @@ class _ClientScreenState extends State<ClientScreen> {
         break;
 
       case 'play':
+        if (msg['latencyMs'] != null) {
+          _hostLatencyMs = (msg['latencyMs'] as num).toDouble();
+          _recomputeLatencyOffset();
+        }
         await _startPlayback(
           (msg['startAtMs'] as num).toDouble(),
           (msg['startPosSec'] as num).toDouble(),
@@ -354,7 +384,10 @@ class _ClientScreenState extends State<ClientScreen> {
 
     // Compute the remaining time AFTER the seek so its cost is absorbed here
     // instead of shifting this phone's start away from the shared timeline.
-    final double wait = startAtMs - _clock.hostNowMs();
+    // This phone starts _latencyOffsetMs earlier so that the sound leaves both
+    // speakers at the same moment (the host's speaker path is slower/faster).
+    final double wait =
+        (startAtMs - _latencyOffsetMs) - _clock.hostNowMs();
     if (wait > 0) {
       _startTimer = Timer(
         Duration(microseconds: (wait * 1000).round()),
@@ -376,7 +409,8 @@ class _ClientScreenState extends State<ClientScreen> {
     final double elapsed = (_clock.hostNowMs() - _startAtMs) / 1000.0;
     if (elapsed < 0.5) return;
 
-    final double expected = (_startPosSec + elapsed) * 1000.0;
+    final double expected =
+        (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
     final double actual = _player.position.inMilliseconds.toDouble();
     final double error = expected - actual;
 
@@ -595,6 +629,53 @@ class _ClientScreenState extends State<ClientScreen> {
     );
   }
 
+  /// Fine tuning control: shifts this phone relative to the host.
+  /// Positive values make this phone play earlier.
+  Widget _nudgeControl() {
+    return Column(
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.tune_rounded, size: 16, color: Colors.white38),
+            const SizedBox(width: 6),
+            const Text(
+              'Sync nudge',
+              style: TextStyle(fontSize: 12, color: Colors.white54),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              '${_nudgeMs > 0 ? '+' : ''}$_nudgeMs ms',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFF818CF8),
+              ),
+            ),
+          ],
+        ),
+        Slider(
+          value: _nudgeMs.toDouble(),
+          min: -60,
+          max: 60,
+          divisions: 24,
+          label: '$_nudgeMs ms',
+          onChanged: (v) => setState(() => _nudgeMs = v.round()),
+          onChangeEnd: (v) async {
+            await DeviceAudio.setNudgeMs(v.round());
+            _recomputeLatencyOffset();
+          },
+        ),
+        const Text(
+          'Positive = this phone plays earlier. Adjust by ear until the two '
+          'phones sound like one.',
+          style: TextStyle(fontSize: 10, color: Colors.white30),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    );
+  }
+
   Widget _speakerView() {
     return Center(
       child: Padding(
@@ -644,6 +725,8 @@ class _ClientScreenState extends State<ClientScreen> {
                   style: const TextStyle(color: Color(0xFF34D399)),
                 ),
               const SizedBox(height: 24),
+              _nudgeControl(),
+              const SizedBox(height: 8),
               TextButton.icon(
                 onPressed: _onDisconnected,
                 icon: const Icon(Icons.logout_rounded, size: 18),

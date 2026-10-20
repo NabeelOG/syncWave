@@ -70,21 +70,21 @@ class ClockSync {
 /// the content and leaves the pipeline delay in place, so a hard seek would
 /// just repeat forever and sound like chopping.
 ///
-/// So the controller only trims the playback *rate* for normal errors and
-/// reserves the (audible) hard seek for a real desync:
+/// The constant part is handled up front (see DeviceAudio / the latency
+/// offset), so all that is left here is real drift:
 ///
-///   |error| <= 15 ms  -> locked, play at exactly 1.000x
-///   15..300 ms        -> proportional speed trim of at most +/-1%
+///   |error| <= 5 ms   -> locked, play at exactly 1.000x
+///   5..300 ms         -> proportional speed trim of at most +/-1.5%
 ///   > 300 ms          -> hard re-seek (stall, late join, ...)
 class Pll {
-  static const double deadbandMs = 15.0;
+  static const double deadbandMs = 5.0;
   static const double hardSeekMs = 300.0;
-  static const double maxTrim = 0.01; // 1% -> ~17 cents, inaudible
+  static const double maxTrim = 0.015; // 1.5% -> ~26 cents, barely audible
 
   /// Speed to apply for the given phase error (expected - actual, ms).
   static double speedFor(double errorMs) {
     if (errorMs.abs() <= deadbandMs) return 1.0;
-    final double trim = (0.0005 * errorMs).clamp(-maxTrim, maxTrim);
+    final double trim = (0.0012 * errorMs).clamp(-maxTrim, maxTrim);
     return 1.0 + trim;
   }
 

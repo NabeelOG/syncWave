@@ -26,10 +26,21 @@ jobs:
 
       - name: Generate Android Platform Files
         run: |
+          # Keep the custom manifest and MainActivity (device audio channel).
           cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml
+          rm -rf /tmp/kt && mkdir -p /tmp/kt
+          if [ -d android/app/src/main/kotlin ]; then
+            cp -r android/app/src/main/kotlin/. /tmp/kt/
+          fi
+
           rm -rf android
           flutter create --platforms=android --project-name syncwave --org com.nabeel .
+
           cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/kotlin
+          cp -r /tmp/kt/. android/app/src/main/kotlin/
+          # Exactly one MainActivity: drop the one flutter create generated.
+          find android/app/src/main -name "MainActivity.*" ! -path "*/kotlin/com/nabeel/syncwave/*" -delete
 
           # compileSdk 36 (needed by current plugins) with targetSdk 34 so Android
           # does not apply Local Network Protection and block the Wi-Fi server.
