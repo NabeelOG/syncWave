@@ -62,9 +62,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   @override
-  void didPushRoute(Route<dynamic> route) {
-    final ip = _ipFromRoute(route.settings.name ?? '');
-    if (ip != null) _openClient(ip);
+  Future<bool> didPushRoute(String route) async {
+    final ip = _ipFromRoute(route);
+    if (ip == null) return false;
+    _openClient(ip);
+    return true;
   }
 
   /// Extracts the host IP from a `syncwave://join?ip=1.2.3.4` link.
