@@ -54,6 +54,7 @@ class _HostScreenState extends State<HostScreen> {
   double _startAtMs = 0;
   double _startPosSec = 0;
   double _speed = 1.0;
+  double _lastSeekAtMs = 0;
 
   Timer? _pll;
   Timer? _startTimer;
@@ -256,6 +257,18 @@ class _HostScreenState extends State<HostScreen> {
       }
     }
 
+    // Pre-roll: park the decoder at 0 and wait until it is ready, so pressing
+    // play does not have to seek (and does not start late).
+    try {
+      await _player.seek(Duration.zero);
+      await _player.processingStateStream
+          .firstWhere((s) => s == ProcessingState.ready)
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => _player.processingState,
+          );
+    } catch (_) {}
+
     _broadcast({
       'type': 'load',
       'trackId': trackId,
@@ -269,7 +282,7 @@ class _HostScreenState extends State<HostScreen> {
     // Use the player's own position: _position is refreshed by positionStream
     // and can be a couple of hundred milliseconds behind.
     final double pos = fromSec ?? (_player.position.inMilliseconds / 1000.0);
-    final double startAt = Monotonic.nowMs() + 1200;
+    final double startAt = Monotonic.nowMs() + 1500;
 
     _broadcast({
       'type': 'play',
@@ -287,7 +300,13 @@ class _HostScreenState extends State<HostScreen> {
     await _player.pause();
     await _player.setSpeed(1.0);
     _speed = 1.0;
-    await _player.seek(Duration(milliseconds: (pos * 1000).round()));
+
+    // Skip the seek when the player is already at the target: seeking costs
+    // 100-500 ms and every phone has to start at the same wall-clock moment.
+    final int targetMs = (pos * 1000).round();
+    if ((_player.position.inMilliseconds - targetMs).abs() > 30) {
+      await _player.seek(Duration(milliseconds: targetMs));
+    }
 
     final wait = startAt - Monotonic.nowMs();
     if (wait > 0) {
@@ -296,6 +315,11 @@ class _HostScreenState extends State<HostScreen> {
         () => _player.play(),
       );
     } else {
+      // Already late: jump to where the room currently is.
+      final int posMs = targetMs + (-wait).round();
+      if ((_player.position.inMilliseconds - posMs).abs() > 30) {
+        await _player.seek(Duration(milliseconds: posMs));
+      }
       _player.play();
     }
   }
@@ -311,23 +335,30 @@ class _HostScreenState extends State<HostScreen> {
   void _keepInSync() {
     if (!_playing || !_player.playing) return;
     final double elapsed = (Monotonic.nowMs() - _startAtMs) / 1000.0;
-    if (elapsed < 0.3) return;
+    if (elapsed < 0.5) return;
 
     final double expected = (_startPosSec + elapsed) * 1000.0;
     final double actual = _player.position.inMilliseconds.toDouble();
     final double error = expected - actual;
 
+    // Hard seeks are audible: only use them for a real desync and rate-limit
+    // them so the audio never turns into chopping.
     if (Pll.needsHardSeek(error)) {
-      _player.seek(Duration(milliseconds: expected.round()));
-      if (_speed != 1.0) {
-        _speed = 1.0;
-        _player.setSpeed(1.0);
+      final double now = Monotonic.nowMs();
+      if (now - _lastSeekAtMs > 2000) {
+        _lastSeekAtMs = now;
+        _player.seek(Duration(milliseconds: expected.round()));
+        if (_speed != 1.0) {
+          _speed = 1.0;
+          _player.setSpeed(1.0);
+        }
       }
       return;
     }
 
+    // Smooth rate trim: no clicks, no audible pitch change.
     final double target = Pll.speedFor(error);
-    if ((target - _speed).abs() > 0.0005) {
+    if ((target - _speed).abs() > 0.0002) {
       _speed = target;
       _player.setSpeed(target);
     }

@@ -55,6 +55,9 @@ class _ClientScreenState extends State<ClientScreen> {
   double? _pendingStartAtMs;
   double? _pendingPosSec;
 
+  // Timestamp of the last hard seek, used to rate-limit audible corrections.
+  double _lastSeekAtMs = 0;
+
   Timer? _pll;
   Timer? _keepAlive;
   Timer? _startTimer;
@@ -289,6 +292,17 @@ class _ClientScreenState extends State<ClientScreen> {
         RamSource(bytes, contentType: audioContentType(title)),
       );
 
+      // Pre-roll: park the decoder at position 0 and wait until the player is
+      // ready, so the "play" command does not have to seek (and does not start
+      // this phone late).
+      await _player.seek(Duration.zero);
+      await _player.processingStateStream
+          .firstWhere((s) => s == ProcessingState.ready)
+          .timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => _player.processingState,
+          );
+
       if (mounted) {
         setState(() {
           _downloading = false;
@@ -329,20 +343,30 @@ class _ClientScreenState extends State<ClientScreen> {
     await _player.setSpeed(1.0);
     _speed = 1.0;
 
+    // Only seek when the player is not already at the right place. A seek on an
+    // MP3 costs 100-500 ms, and that cost must not delay the start: every phone
+    // would otherwise start a different amount late.
+    final int targetMs = (startPosSec * 1000).round();
+    final int currentMs = _player.position.inMilliseconds;
+    if ((currentMs - targetMs).abs() > 30) {
+      await _player.seek(Duration(milliseconds: targetMs));
+    }
+
+    // Compute the remaining time AFTER the seek so its cost is absorbed here
+    // instead of shifting this phone's start away from the shared timeline.
     final double wait = startAtMs - _clock.hostNowMs();
     if (wait > 0) {
-      await _player.seek(
-        Duration(milliseconds: (startPosSec * 1000).round()),
-      );
       _startTimer = Timer(
         Duration(microseconds: (wait * 1000).round()),
         () => _player.play(),
       );
     } else {
-      final double catchUp = startPosSec - wait / 1000.0;
-      await _player.seek(
-        Duration(milliseconds: (catchUp * 1000).round()),
-      );
+      // Already late: jump straight to where the room currently is, so the
+      // content matches even though the start instant was missed.
+      final int posMs = targetMs + (-wait).round();
+      if ((_player.position.inMilliseconds - posMs).abs() > 30) {
+        await _player.seek(Duration(milliseconds: posMs));
+      }
       _player.play();
     }
   }
@@ -350,23 +374,31 @@ class _ClientScreenState extends State<ClientScreen> {
   void _keepInSync() {
     if (!_playing || !_player.playing || !_ready) return;
     final double elapsed = (_clock.hostNowMs() - _startAtMs) / 1000.0;
-    if (elapsed < 0.3) return;
+    if (elapsed < 0.5) return;
 
     final double expected = (_startPosSec + elapsed) * 1000.0;
     final double actual = _player.position.inMilliseconds.toDouble();
     final double error = expected - actual;
 
+    // A hard seek is audible, so it is only used for a real desync and never
+    // twice in a row (the constant offset between two phones must not trigger
+    // it, otherwise the audio turns into chopping).
     if (Pll.needsHardSeek(error)) {
-      _player.seek(Duration(milliseconds: expected.round()));
-      if (_speed != 1.0) {
-        _speed = 1.0;
-        _player.setSpeed(1.0);
+      final double now = Monotonic.nowMs();
+      if (now - _lastSeekAtMs > 2000) {
+        _lastSeekAtMs = now;
+        _player.seek(Duration(milliseconds: expected.round()));
+        if (_speed != 1.0) {
+          _speed = 1.0;
+          _player.setSpeed(1.0);
+        }
       }
       return;
     }
 
+    // Smooth rate trim: no clicks, no audible pitch change.
     final double target = Pll.speedFor(error);
-    if ((target - _speed).abs() > 0.0005) {
+    if ((target - _speed).abs() > 0.0002) {
       _speed = target;
       _player.setSpeed(target);
     }

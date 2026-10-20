@@ -64,17 +64,28 @@ class ClockSync {
 
 /// Drift correction.
 ///
-///   |error| < 2.5 ms  -> locked, play at exactly 1.000x
-///   2.5..45 ms       -> proportional speed trim (no clicks, no pitch jump)
-///   > 45 ms          -> hard re-seek
+/// Two phones never start at exactly the same moment: each phone has its own
+/// audio pipeline start-up delay (20-100 ms) and its own output latency. That
+/// offset is constant and cannot be removed by seeking - seeking only shifts
+/// the content and leaves the pipeline delay in place, so a hard seek would
+/// just repeat forever and sound like chopping.
+///
+/// So the controller only trims the playback *rate* for normal errors and
+/// reserves the (audible) hard seek for a real desync:
+///
+///   |error| <= 15 ms  -> locked, play at exactly 1.000x
+///   15..300 ms        -> proportional speed trim of at most +/-1%
+///   > 300 ms          -> hard re-seek (stall, late join, ...)
 class Pll {
-  static const double deadbandMs = 2.5;
-  static const double hardSeekMs = 45.0;
+  static const double deadbandMs = 15.0;
+  static const double hardSeekMs = 300.0;
+  static const double maxTrim = 0.01; // 1% -> ~17 cents, inaudible
 
   /// Speed to apply for the given phase error (expected - actual, ms).
   static double speedFor(double errorMs) {
-    if (errorMs.abs() < deadbandMs) return 1.0;
-    return (1.0 + 0.00085 * errorMs).clamp(0.965, 1.035);
+    if (errorMs.abs() <= deadbandMs) return 1.0;
+    final double trim = (0.0005 * errorMs).clamp(-maxTrim, maxTrim);
+    return 1.0 + trim;
   }
 
   static bool needsHardSeek(double errorMs) => errorMs.abs() > hardSeekMs;
