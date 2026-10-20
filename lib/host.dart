@@ -39,12 +39,14 @@ class _HostScreenState extends State<HostScreen> {
   HttpServer? _server;
   List<String> _ips = [];
   int _ipIndex = 0;
+  int _peerCounter = 0;
   String _hostIp = '';
   String? _error;
   bool _playing = false;
 
   Uint8List? _song;
   String _songName = 'No song selected';
+  String _songType = 'audio/mpeg';
   String _trackId = '';
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
@@ -110,7 +112,8 @@ class _HostScreenState extends State<HostScreen> {
 
     if (path == '/track.mp3' && _song != null) {
       final song = _song!;
-      req.response.headers.contentType = ContentType('audio', 'mpeg');
+      req.response.headers.contentType =
+          ContentType.parse(_songType);
       req.response.headers.contentLength = song.length;
       req.response.add(song);
       await req.response.close();
@@ -120,13 +123,23 @@ class _HostScreenState extends State<HostScreen> {
     if (path == '/ws' && WebSocketTransformer.isUpgradeRequest(req)) {
       final ws = await WebSocketTransformer.upgrade(req);
       final id = 'p${DateTime.now().microsecondsSinceEpoch % 100000}';
-      final peer = Peer(ws, 'Friend ${_peers.length + 1}');
-      setState(() => _peers[id] = peer);
+      final peer = Peer(ws, 'Friend ${_peerCounter + 1}');
+      _peerCounter++;
+      if (mounted) setState(() => _peers[id] = peer);
+
       ws.listen(
         (data) => _onPeerMessage(peer, data as String),
-        onDone: () => setState(() => _peers.remove(id)),
-        onError: (_) => setState(() => _peers.remove(id)),
+        onDone: () {
+          if (mounted) setState(() => _peers.remove(id));
+        },
+        onError: (_) {
+          if (mounted) setState(() => _peers.remove(id));
+        },
       );
+
+      // Send the current state so a phone that joins late still gets the song
+      // and starts in sync with everybody else.
+      _sendStateTo(peer);
       return;
     }
 
@@ -173,6 +186,27 @@ class _HostScreenState extends State<HostScreen> {
     }
   }
 
+  /// Sends the current song (and the current playback position) to a peer
+  /// that just connected, so late joiners are in sync too.
+  void _sendStateTo(Peer peer) {
+    final song = _song;
+    if (song != null) {
+      peer.socket.add(jsonEncode({
+        'type': 'load',
+        'trackId': _trackId,
+        'title': _songName,
+        'size': song.length,
+      }));
+    }
+    if (_playing) {
+      peer.socket.add(jsonEncode({
+        'type': 'play',
+        'startAtMs': Monotonic.nowMs(),
+        'startPosSec': _player.position.inMilliseconds / 1000.0,
+      }));
+    }
+  }
+
   Future<void> _pickSong() async {
     PlatformFile? picked;
     try {
@@ -203,6 +237,7 @@ class _HostScreenState extends State<HostScreen> {
     setState(() {
       _song = bytes;
       _songName = name;
+      _songType = audioContentType(name);
       _trackId = trackId;
       _playing = false;
       for (final p in _peers.values) {
@@ -212,7 +247,7 @@ class _HostScreenState extends State<HostScreen> {
     });
 
     try {
-      await _player.setAudioSource(RamSource(bytes));
+      await _player.setAudioSource(RamSource(bytes, contentType: _songType));
     } catch (_) {
       if (path != null) {
         try {
@@ -231,7 +266,9 @@ class _HostScreenState extends State<HostScreen> {
 
   Future<void> _play({double? fromSec}) async {
     if (_song == null) return;
-    final double pos = fromSec ?? (_position.inMilliseconds / 1000.0);
+    // Use the player's own position: _position is refreshed by positionStream
+    // and can be a couple of hundred milliseconds behind.
+    final double pos = fromSec ?? (_player.position.inMilliseconds / 1000.0);
     final double startAt = Monotonic.nowMs() + 1200;
 
     _broadcast({

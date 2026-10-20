@@ -50,9 +50,15 @@ class _ClientScreenState extends State<ClientScreen> {
   double _startPosSec = 0;
   double _speed = 1.0;
 
+  // A play command that arrived before the song was downloaded / the clock was
+  // locked. It is applied as soon as both are ready.
+  double? _pendingStartAtMs;
+  double? _pendingPosSec;
+
   Timer? _pll;
   Timer? _keepAlive;
   Timer? _startTimer;
+  Future<void> _msgChain = Future<void>.value();
 
   @override
   void initState() {
@@ -60,13 +66,15 @@ class _ClientScreenState extends State<ClientScreen> {
     WakelockPlus.enable();
     _pll = Timer.periodic(
       const Duration(milliseconds: 250),
-      (_) => _keepInSync(),
+      (_) => _tick(),
     );
-    _search();
 
     final auto = widget.autoJoinIp;
     if (auto != null && auto.isNotEmpty) {
+      // Deep link: we already know the host, no need to scan the network.
       WidgetsBinding.instance.addPostFrameCallback((_) => _connect(auto));
+    } else {
+      _search();
     }
   }
 
@@ -112,13 +120,13 @@ class _ClientScreenState extends State<ClientScreen> {
         throw const FormatException('not a SyncWave host');
       }
       _hostPort = (data['port'] as num?)?.toInt() ?? 8080;
-    } catch (_) {
+    } catch (e) {
       client.close(force: true);
       if (mounted) {
         setState(() {
           _connecting = false;
-          _error = 'Cannot reach $ip. Both phones must be on the same Wi-Fi, '
-              'or join the host phone\'s hotspot.';
+          _error = 'Cannot reach $ip ($e). Both phones must be on the same '
+              'Wi-Fi, or join the host phone\'s hotspot.';
         });
       }
       return;
@@ -132,7 +140,15 @@ class _ClientScreenState extends State<ClientScreen> {
       ws.add(jsonEncode({'type': 'hello', 'name': widget.deviceName}));
 
       ws.listen(
-        (data) => _onMessage(data as String),
+        (data) {
+          // Process messages strictly in order: a 'load' and a 'play' must not
+          // be handled concurrently.
+          _msgChain = _msgChain.then((_) async {
+            try {
+              await _onMessage(data as String);
+            } catch (_) {}
+          });
+        },
         onDone: _onDisconnected,
         onError: (_) => _onDisconnected(),
       );
@@ -195,6 +211,8 @@ class _ClientScreenState extends State<ClientScreen> {
 
       case 'pause':
         _startTimer?.cancel();
+        _pendingStartAtMs = null;
+        _pendingPosSec = null;
         final pos = (msg['posSec'] as num).toDouble();
         if (mounted) setState(() => _playing = false);
         await _player.pause();
@@ -206,6 +224,8 @@ class _ClientScreenState extends State<ClientScreen> {
   void _onDisconnected() {
     _keepAlive?.cancel();
     _startTimer?.cancel();
+    _pendingStartAtMs = null;
+    _pendingPosSec = null;
     _player.stop();
     if (mounted) {
       setState(() {
@@ -243,9 +263,10 @@ class _ClientScreenState extends State<ClientScreen> {
 
     try {
       final client = HttpClient();
-      final req =
-          await client.getUrl(Uri.parse('http://$ip:$_hostPort/track.mp3?id=$trackId'));
-      final resp = await req.close();
+      final req = await client
+          .getUrl(Uri.parse('http://$ip:$_hostPort/track.mp3?id=$trackId'))
+          .timeout(const Duration(seconds: 10));
+      final resp = await req.close().timeout(const Duration(seconds: 60));
 
       final int total = resp.contentLength;
       final builder = BytesBuilder(copy: false);
@@ -264,7 +285,9 @@ class _ClientScreenState extends State<ClientScreen> {
       }
 
       final bytes = builder.takeBytes();
-      await _player.setAudioSource(RamSource(bytes));
+      await _player.setAudioSource(
+        RamSource(bytes, contentType: audioContentType(title)),
+      );
 
       if (mounted) {
         setState(() {
@@ -285,7 +308,13 @@ class _ClientScreenState extends State<ClientScreen> {
   }
 
   Future<void> _startPlayback(double startAtMs, double startPosSec) async {
-    if (!_ready) return;
+    if (!_ready || !_clock.locked) {
+      // Song still downloading or the clock is not synchronised yet: remember the
+      // command and run it as soon as both are ready.
+      _pendingStartAtMs = startAtMs;
+      _pendingPosSec = startPosSec;
+      return;
+    }
     _startTimer?.cancel();
 
     if (mounted) {
@@ -341,6 +370,21 @@ class _ClientScreenState extends State<ClientScreen> {
       _speed = target;
       _player.setSpeed(target);
     }
+  }
+
+  /// Runs every 250 ms: applies a play command that arrived before the song was
+  /// ready, then keeps the playback locked to the host clock.
+  void _tick() {
+    if (_pendingStartAtMs != null) {
+      if (!_ready || !_clock.locked) return;
+      final double at = _pendingStartAtMs!;
+      final double pos = _pendingPosSec!;
+      _pendingStartAtMs = null;
+      _pendingPosSec = null;
+      _startPlayback(at, pos);
+      return;
+    }
+    _keepInSync();
   }
 
   @override

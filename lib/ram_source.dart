@@ -6,8 +6,9 @@ import 'package:just_audio/just_audio.dart';
 /// Avoids flash-storage I/O jitter when playback starts.
 class RamSource extends StreamAudioSource {
   final Uint8List bytes;
+  final String contentType;
 
-  RamSource(this.bytes, {super.tag});
+  RamSource(this.bytes, {this.contentType = 'audio/mpeg', super.tag});
 
   @override
   Future<StreamAudioResponse> request([int? start, int? end]) async {
@@ -18,7 +19,23 @@ class RamSource extends StreamAudioSource {
       contentLength: to - from,
       offset: from,
       stream: Stream.value(Uint8List.sublistView(bytes, from, to)),
-      contentType: 'audio/mpeg',
+      contentType: contentType,
     );
+  }
+}
+
+/// Maps a file extension to the matching audio content type.
+String audioContentType(String fileName) {
+  final ext = fileName.toLowerCase().split('.').last;
+  switch (ext) {
+    case 'wav':
+      return 'audio/wav';
+    case 'm4a':
+    case 'aac':
+      return 'audio/mp4';
+    case 'ogg':
+      return 'audio/ogg';
+    default:
+      return 'audio/mpeg';
   }
 }
