@@ -17,6 +17,7 @@ import 'sync.dart';
 
 class Peer {
   final WebSocket socket;
+  final OffsetEstimator reverse = OffsetEstimator();
   String name;
   bool ready;
   int progress;
@@ -37,6 +38,7 @@ class HostScreen extends StatefulWidget {
 
 class _HostScreenState extends State<HostScreen> {
   final AudioPlayer _player = AudioPlayer();
+  final PositionTracker _position = PositionTracker();
   final Map<String, Peer> _peers = {};
 
   HttpServer? _server;
@@ -51,13 +53,17 @@ class _HostScreenState extends State<HostScreen> {
   String _songName = 'No song selected';
   String _songType = 'audio/mpeg';
   String _trackId = '';
-  Duration _position = Duration.zero;
+  Duration _positionUi = Duration.zero;
   Duration _duration = Duration.zero;
 
   double _startAtMs = 0;
   double _startPosSec = 0;
   double _speed = 1.0;
   double _lastSeekAtMs = 0;
+
+  // Last phase error and the time it was measured, used to derive the rate
+  // error (ms of drift per ms of time).
+  double _lastErrorMs = 0;
 
   // Estimated latency between the player emitting a sample and the sound
   // leaving this phone's speaker. Clients use it together with their own value
@@ -66,15 +72,21 @@ class _HostScreenState extends State<HostScreen> {
 
   Timer? _pll;
   Timer? _startTimer;
+  Timer? _clockPingTimer;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration?>? _durSub;
+
+  // Rate error estimate (ms of phase drift per ms of time).
+  double _rateEstimate = 0;
+  double _lastErrorAtMs = 0;
 
   @override
   void initState() {
     super.initState();
     WakelockPlus.enable();
     _posSub = _player.positionStream.listen((p) {
-      if (mounted) setState(() => _position = p);
+      _position.sync(p.inMilliseconds.toDouble());
+      if (mounted) setState(() => _positionUi = p);
     });
     _durSub = _player.durationStream.listen((d) {
       if (mounted && d != null) setState(() => _duration = d);
@@ -100,6 +112,16 @@ class _HostScreenState extends State<HostScreen> {
           _hostIp = ips.isNotEmpty ? ips.first : '';
         });
       }
+
+      // Probe every client's clock in the opposite direction so that both
+      // sides can pick the measurement with the lower delay (and therefore the
+      // smaller asymmetry bias).
+      _clockPingTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        final double now = Monotonic.nowMs();
+        for (final peer in _peers.values) {
+          peer.socket.add(jsonEncode({'type': 'ping2', 't1h': now}));
+        }
+      });
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
     }
@@ -171,6 +193,27 @@ class _HostScreenState extends State<HostScreen> {
           't3': Monotonic.nowMs(),
         }));
         break;
+
+      case 'pong2':
+        // The client answered our reverse-direction clock probe. Its own
+        // estimate of the offset is more trustworthy than ours when the
+        // reverse path was the faster one, so we hand it over.
+        final double t1h = (msg['t1h'] as num).toDouble();
+        final double t2c = (msg['t2c'] as num).toDouble();
+        final double t3c = (msg['t3c'] as num).toDouble();
+        final double t4h = Monotonic.nowMs();
+
+        final double rtt = (t4h - t1h) - (t3c - t2c);
+        // The host's view of (client clock - host clock).
+        final double offset = ((t2c - t1h) + (t3c - t4h)) / 2.0;
+        peer.reverse.add(rtt, offset);
+
+        peer.socket.add(jsonEncode({
+          'type': 'clock',
+          'deltaMs': -peer.reverse.offsetMs,
+          'rttMs': peer.reverse.minRttMs,
+        }));
+        break;
       case 'hello':
         if (mounted) {
           final name = (msg['name'] as String?)?.trim();
@@ -214,7 +257,7 @@ class _HostScreenState extends State<HostScreen> {
       peer.socket.add(jsonEncode({
         'type': 'play',
         'startAtMs': Monotonic.nowMs(),
-        'startPosSec': _player.position.inMilliseconds / 1000.0,
+        'startPosSec': _position.positionMs / 1000.0,
       }));
     }
   }
@@ -272,6 +315,7 @@ class _HostScreenState extends State<HostScreen> {
     // play does not have to seek (and does not start late).
     try {
       await _player.seek(Duration.zero);
+      _position.reset(0);
       await _player.processingStateStream
           .firstWhere((s) => s == ProcessingState.ready)
           .timeout(
@@ -292,7 +336,7 @@ class _HostScreenState extends State<HostScreen> {
     if (_song == null) return;
     // Use the player's own position: _position is refreshed by positionStream
     // and can be a couple of hundred milliseconds behind.
-    final double pos = fromSec ?? (_player.position.inMilliseconds / 1000.0);
+    final double pos = fromSec ?? (_position.positionMs / 1000.0);
     final double startAt = Monotonic.nowMs() + 1500;
 
     _broadcast({
@@ -316,9 +360,10 @@ class _HostScreenState extends State<HostScreen> {
     // Skip the seek when the player is already at the target: seeking costs
     // 100-500 ms and every phone has to start at the same wall-clock moment.
     final int targetMs = (pos * 1000).round();
-    if ((_player.position.inMilliseconds - targetMs).abs() > 30) {
+    if ((_position.positionMs.round() - targetMs).abs() > 30) {
       await _player.seek(Duration(milliseconds: targetMs));
     }
+    _position.reset(targetMs.toDouble());
 
     final wait = startAt - Monotonic.nowMs();
     if (wait > 0) {
@@ -329,16 +374,17 @@ class _HostScreenState extends State<HostScreen> {
     } else {
       // Already late: jump to where the room currently is.
       final int posMs = targetMs + (-wait).round();
-      if ((_player.position.inMilliseconds - posMs).abs() > 30) {
+      if ((_position.positionMs.round() - posMs).abs() > 30) {
         await _player.seek(Duration(milliseconds: posMs));
       }
+      _position.reset(posMs.toDouble());
       _player.play();
     }
   }
 
   Future<void> _pause() async {
     _startTimer?.cancel();
-    final double pos = _player.position.inMilliseconds / 1000.0;
+    final double pos = _position.positionMs / 1000.0;
     setState(() => _playing = false);
     await _player.pause();
     _broadcast({'type': 'pause', 'posSec': pos});
@@ -350,18 +396,31 @@ class _HostScreenState extends State<HostScreen> {
     if (elapsed < 0.5) return;
 
     final double expected = (_startPosSec + elapsed) * 1000.0;
-    final double actual = _player.position.inMilliseconds.toDouble();
+    final double actual = _position.positionMs;
     final double error = expected - actual;
+
+    // Rate error estimate: how fast the phase error grows.
+    final double now = Monotonic.nowMs();
+    if (_lastErrorAtMs > 0) {
+      final double dt = now - _lastErrorAtMs;
+      if (dt > 1000) {
+        final double d = (error - _lastErrorMs) / dt;
+        _rateEstimate = _rateEstimate * 0.7 + d * 0.3;
+      }
+    }
+    _lastErrorMs = error;
+    _lastErrorAtMs = now;
 
     // Hard seeks are audible: only use them for a real desync and rate-limit
     // them so the audio never turns into chopping.
     if (Pll.needsHardSeek(error)) {
-      final double now = Monotonic.nowMs();
       if (now - _lastSeekAtMs > 2000) {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
+        _position.reset(expected);
         if (_speed != 1.0) {
           _speed = 1.0;
+          _position.setSpeed(1.0);
           _player.setSpeed(1.0);
         }
       }
@@ -369,9 +428,10 @@ class _HostScreenState extends State<HostScreen> {
     }
 
     // Smooth rate trim: no clicks, no audible pitch change.
-    final double target = Pll.speedFor(error);
+    final double target = Pll.speedFor(error, rateError: _rateEstimate);
     if ((target - _speed).abs() > 0.0002) {
       _speed = target;
+      _position.setSpeed(target);
       _player.setSpeed(target);
     }
   }
@@ -386,6 +446,7 @@ class _HostScreenState extends State<HostScreen> {
   void dispose() {
     _pll?.cancel();
     _startTimer?.cancel();
+    _clockPingTimer?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
     _server?.close(force: true);
@@ -571,7 +632,7 @@ class _HostScreenState extends State<HostScreen> {
                     label: const Text('Choose MP3 from Phone'),
                   ),
                   Slider(
-                    value: _position.inMilliseconds
+                    value: _positionUi.inMilliseconds
                         .toDouble()
                         .clamp(0, _duration.inMilliseconds.toDouble() + 1),
                     min: 0,
@@ -582,13 +643,13 @@ class _HostScreenState extends State<HostScreen> {
                       if (_song != null) _play(fromSec: ms / 1000.0);
                     },
                     onChanged: (ms) => setState(() {
-                      _position = Duration(milliseconds: ms.round());
+                      _positionUi = Duration(milliseconds: ms.round());
                     }),
                   ),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(_fmt(_position)),
+                      Text(_fmt(_positionUi)),
                       Text(_fmt(_duration)),
                     ],
                   ),

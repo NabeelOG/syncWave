@@ -28,6 +28,7 @@ class ClientScreen extends StatefulWidget {
 class _ClientScreenState extends State<ClientScreen> {
   final AudioPlayer _player = AudioPlayer();
   final ClockSync _clock = ClockSync();
+  final PositionTracker _position = PositionTracker();
   final TextEditingController _ipInput = TextEditingController();
 
   WebSocket? _ws;
@@ -65,6 +66,12 @@ class _ClientScreenState extends State<ClientScreen> {
   // Deadline until which the drift correction uses the stronger gain.
   double _aggressiveUntilMs = 0;
 
+  // Rate error estimate (ms of phase drift per ms of time) and the time of the
+  // previous measurement, used to derive it.
+  double _rateEstimate = 0;
+  double _lastErrorAtMs = 0;
+  double _prevErrorMs = 0;
+
   /// How much earlier this phone must start than the host so that the sound
   /// leaves both speakers at the same moment:
   ///   (my output latency - host output latency) + manual nudge
@@ -79,12 +86,20 @@ class _ClientScreenState extends State<ClientScreen> {
   Timer? _startTimer;
   Timer? _searchTimer;
   Timer? _syncCheckTimer;
+  StreamSubscription<Duration>? _posSub;
   Future<void> _msgChain = Future<void>.value();
 
   @override
   void initState() {
     super.initState();
     WakelockPlus.enable();
+
+    // Track the playhead on the monotonic clock: the player's own position
+    // interpolation uses the wall clock, which Android adjusts over time.
+    _posSub = _player.positionStream.listen((p) {
+      _position.sync(p.inMilliseconds.toDouble());
+    });
+
     _loadDeviceAudio();
     _pll = Timer.periodic(
       const Duration(milliseconds: 200),
@@ -250,6 +265,26 @@ class _ClientScreenState extends State<ClientScreen> {
         );
         break;
 
+      case 'ping2':
+        // The host is measuring this phone's clock in the other direction.
+        // Answer with our receive/send timestamps so it can cancel the
+        // asymmetric delay of the uplink.
+        _ws?.add(jsonEncode({
+          'type': 'pong2',
+          't1h': msg['t1h'],
+          't2c': t4,
+          't3c': Monotonic.nowMs(),
+        }));
+        break;
+
+      case 'clock':
+        // The host's own estimate of the clock offset.
+        _clock.setReverse(
+          (msg['deltaMs'] as num).toDouble(),
+          (msg['rttMs'] as num).toDouble(),
+        );
+        break;
+
       case 'load':
         final trackId = (msg['trackId'] as String?) ?? '';
         final title = (msg['title'] as String?) ?? 'Shared song';
@@ -352,6 +387,7 @@ class _ClientScreenState extends State<ClientScreen> {
       // ready, so the "play" command does not have to seek (and does not start
       // this phone late).
       await _player.seek(Duration.zero);
+      _position.reset(0);
       await _player.processingStateStream
           .firstWhere((s) => s == ProcessingState.ready)
           .timeout(
@@ -403,10 +439,11 @@ class _ClientScreenState extends State<ClientScreen> {
     // MP3 costs 100-500 ms, and that cost must not delay the start: every phone
     // would otherwise start a different amount late.
     final int targetMs = (startPosSec * 1000).round();
-    final int currentMs = _player.position.inMilliseconds;
+    final int currentMs = _position.positionMs.round();
     if ((currentMs - targetMs).abs() > 30) {
       await _player.seek(Duration(milliseconds: targetMs));
     }
+    _position.reset(targetMs.toDouble());
 
     // Compute the remaining time AFTER the seek so its cost is absorbed here
     // instead of shifting this phone's start away from the shared timeline.
@@ -423,9 +460,10 @@ class _ClientScreenState extends State<ClientScreen> {
       // Already late: jump straight to where the room currently is, so the
       // content matches even though the start instant was missed.
       final int posMs = targetMs + (-wait).round();
-      if ((_player.position.inMilliseconds - posMs).abs() > 30) {
+      if ((_position.positionMs.round() - posMs).abs() > 30) {
         await _player.seek(Duration(milliseconds: posMs));
       }
+      _position.reset(posMs.toDouble());
       _player.play();
     }
   }
@@ -437,8 +475,10 @@ class _ClientScreenState extends State<ClientScreen> {
 
     final double expected =
         (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
-    final double actual = _player.position.inMilliseconds.toDouble();
+    final double actual = _position.positionMs;
     final double error = expected - actual;
+
+    _updateRate(error);
 
     if (mounted && (error - _lastErrorMs).abs() > 1.0) {
       setState(() => _lastErrorMs = error);
@@ -452,8 +492,10 @@ class _ClientScreenState extends State<ClientScreen> {
       if (now - _lastSeekAtMs > 2000) {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
+        _position.reset(expected);
         if (_speed != 1.0) {
           _speed = 1.0;
+          _position.setSpeed(1.0);
           _player.setSpeed(1.0);
         }
       }
@@ -466,6 +508,22 @@ class _ClientScreenState extends State<ClientScreen> {
     _applyTrim(error, aggressive: aggressive);
   }
 
+  /// Estimates how fast the phase error is growing (ms of drift per ms of
+  /// time). This is the difference between the two phones' crystal clocks and
+  /// is what the integral term of the controller cancels.
+  void _updateRate(double error) {
+    final double now = Monotonic.nowMs();
+    if (_lastErrorAtMs > 0) {
+      final double dt = now - _lastErrorAtMs;
+      if (dt > 1000) {
+        final double d = (error - _prevErrorMs) / dt;
+        _rateEstimate = _rateEstimate * 0.7 + d * 0.3;
+      }
+    }
+    _prevErrorMs = error;
+    _lastErrorAtMs = now;
+  }
+
   /// Periodic (5 s) sync check. If this phone has drifted noticeably out of
   /// phase it pulls in harder than the continuous loop so it locks on within
   /// a couple of seconds instead of slowly creeping back.
@@ -476,7 +534,7 @@ class _ClientScreenState extends State<ClientScreen> {
 
     final double expected =
         (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
-    final double actual = _player.position.inMilliseconds.toDouble();
+    final double actual = _position.positionMs;
     final double error = expected - actual;
 
     if (Pll.needsHardSeek(error)) {
@@ -484,8 +542,10 @@ class _ClientScreenState extends State<ClientScreen> {
       if (now - _lastSeekAtMs > 2000) {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
+        _position.reset(expected);
         if (_speed != 1.0) {
           _speed = 1.0;
+          _position.setSpeed(1.0);
           _player.setSpeed(1.0);
         }
       }
@@ -500,9 +560,14 @@ class _ClientScreenState extends State<ClientScreen> {
   }
 
   void _applyTrim(double error, {required bool aggressive}) {
-    final double target = Pll.speedFor(error, aggressive: aggressive);
+    final double target = Pll.speedFor(
+      error,
+      rateError: _rateEstimate,
+      aggressive: aggressive,
+    );
     if ((target - _speed).abs() > 0.0002) {
       _speed = target;
+      _position.setSpeed(target);
       _player.setSpeed(target);
     }
   }
@@ -529,6 +594,7 @@ class _ClientScreenState extends State<ClientScreen> {
     _startTimer?.cancel();
     _searchTimer?.cancel();
     _syncCheckTimer?.cancel();
+    _posSub?.cancel();
     _ws?.close();
     _ipInput.dispose();
     _player.dispose();
