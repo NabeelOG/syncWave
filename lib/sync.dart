@@ -158,31 +158,39 @@ class ClockSync {
 ///   rate term   - cancels the difference between the two crystal clocks
 ///                 (100 ppm would be 24 ms over four minutes)
 ///
-///   |error| <= deadband -> locked, play at exactly 1.000x
+/// The controller is a PI controller:
+///
+///   phase term    - pulls the playhead onto the host's timeline (transient)
+///   integral term - accumulates the phase error and therefore cancels a
+///                   constant disturbance such as the difference between the
+///                   two crystal clocks (100 ppm = 24 ms over four minutes)
+///                   *without* the error having to grow first
+///
+///   |error| <= deadband -> no phase term, but the integral keeps holding
 ///   > 300 ms            -> hard re-seek (stall, late join, ...)
 class Pll {
-  static const double deadbandMs = 5.0;
+  /// Phase errors below this are measurement noise, so the phase term is off.
+  static const double deadbandMs = 2.0;
   static const double hardSeekMs = 300.0;
 
   static const double maxTrim = 0.015; // 1.5% -> ~26 cents, barely audible
-  static const double maxRateTrim = 0.004; // 0.4%
+  static const double maxIntegral = 0.008; // 0.8%
   static const double gain = 0.0006; // per ms of phase error
-  static const double rateGain = 0.8; // per ms/ms of rate error
+  static const double integralGain = 0.00008; // per ms*s of accumulated error
 
-  /// Speed for the given phase error (expected - actual, ms) and rate error
-  /// (ms of phase drift per ms of time).
+  /// Speed for the given phase error (expected - actual, ms) and the
+  /// accumulated integral term.
   static double speedFor(
     double errorMs, {
-    double rateError = 0.0,
+    double integral = 0.0,
     bool aggressive = false,
   }) {
-    if (errorMs.abs() <= deadbandMs) return 1.0;
-    final double g = aggressive ? gain * 2.5 : gain;
     final double cap = aggressive ? 0.03 : maxTrim;
-    final double phase = (g * errorMs).clamp(-cap, cap);
-    final double rate =
-        (rateGain * rateError).clamp(-maxRateTrim, maxRateTrim);
-    return 1.0 + phase + rate;
+    final double g = aggressive ? gain * 2.5 : gain;
+    final double phase =
+        errorMs.abs() <= deadbandMs ? 0.0 : (g * errorMs).clamp(-cap, cap);
+    final double i = integral.clamp(-maxIntegral, maxIntegral);
+    return 1.0 + phase + i;
   }
 
   static bool needsHardSeek(double errorMs) => errorMs.abs() > hardSeekMs;

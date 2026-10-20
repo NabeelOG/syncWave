@@ -61,10 +61,6 @@ class _HostScreenState extends State<HostScreen> {
   double _speed = 1.0;
   double _lastSeekAtMs = 0;
 
-  // Last phase error and the time it was measured, used to derive the rate
-  // error (ms of drift per ms of time).
-  double _lastErrorMs = 0;
-
   // Estimated latency between the player emitting a sample and the sound
   // leaving this phone's speaker. Clients use it together with their own value
   // to line the two phones up.
@@ -76,9 +72,12 @@ class _HostScreenState extends State<HostScreen> {
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration?>? _durSub;
 
-  // Rate error estimate (ms of phase drift per ms of time).
-  double _rateEstimate = 0;
+  // Integral term of the drift controller and the sign of the previous error
+  // (used to tell a real drift apart from measurement noise).
+  double _integral = 0;
+  double _prevErrorSign = 0;
   double _lastErrorAtMs = 0;
+  double _filteredErrorMs = 0;
 
   @override
   void initState() {
@@ -347,6 +346,10 @@ class _HostScreenState extends State<HostScreen> {
     });
 
     _startTimer?.cancel();
+    _integral = 0;
+    _prevErrorSign = 0;
+    _lastErrorAtMs = 0;
+    _filteredErrorMs = 0;
     setState(() {
       _playing = true;
       _startAtMs = startAt;
@@ -399,17 +402,21 @@ class _HostScreenState extends State<HostScreen> {
     final double actual = _position.positionMs;
     final double error = expected - actual;
 
-    // Rate error estimate: how fast the phase error grows.
     final double now = Monotonic.nowMs();
-    if (_lastErrorAtMs > 0) {
-      final double dt = now - _lastErrorAtMs;
-      if (dt > 1000) {
-        final double d = (error - _lastErrorMs) / dt;
-        _rateEstimate = _rateEstimate * 0.7 + d * 0.3;
-      }
-    }
-    _lastErrorMs = error;
+    final double dt = _lastErrorAtMs > 0 ? (now - _lastErrorAtMs) / 1000.0 : 0.2;
     _lastErrorAtMs = now;
+
+    // Integral term: cancels the constant difference between this phone's
+    // crystal clock and the room's timeline. The sign-consistency check keeps
+    // measurement noise out (noise flips sign, a real drift does not).
+    _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
+    final double sign = _filteredErrorMs.sign;
+    if (_filteredErrorMs.abs() > 1.0 && sign == _prevErrorSign) {
+      _integral += Pll.integralGain * _filteredErrorMs * dt;
+    }
+    _prevErrorSign = sign;
+    _integral *= 0.9995;
+    _integral = _integral.clamp(-Pll.maxIntegral, Pll.maxIntegral);
 
     // Hard seeks are audible: only use them for a real desync and rate-limit
     // them so the audio never turns into chopping.
@@ -418,6 +425,9 @@ class _HostScreenState extends State<HostScreen> {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
         _position.reset(expected);
+        _integral = 0;
+        _prevErrorSign = 0;
+        _filteredErrorMs = 0;
         if (_speed != 1.0) {
           _speed = 1.0;
           _position.setSpeed(1.0);
@@ -428,7 +438,8 @@ class _HostScreenState extends State<HostScreen> {
     }
 
     // Smooth rate trim: no clicks, no audible pitch change.
-    final double target = Pll.speedFor(error, rateError: _rateEstimate);
+    final double target =
+        Pll.speedFor(_filteredErrorMs, integral: _integral);
     if ((target - _speed).abs() > 0.0002) {
       _speed = target;
       _position.setSpeed(target);

@@ -66,11 +66,12 @@ class _ClientScreenState extends State<ClientScreen> {
   // Deadline until which the drift correction uses the stronger gain.
   double _aggressiveUntilMs = 0;
 
-  // Rate error estimate (ms of phase drift per ms of time) and the time of the
-  // previous measurement, used to derive it.
-  double _rateEstimate = 0;
+  // Integral term of the drift controller and the sign of the previous error
+  // (used to tell a real drift apart from measurement noise).
+  double _integral = 0;
+  double _prevErrorSign = 0;
   double _lastErrorAtMs = 0;
-  double _prevErrorMs = 0;
+  double _filteredErrorMs = 0;
 
   /// How much earlier this phone must start than the host so that the sound
   /// leaves both speakers at the same moment:
@@ -422,6 +423,7 @@ class _ClientScreenState extends State<ClientScreen> {
       return;
     }
     _startTimer?.cancel();
+    _resetController();
 
     if (mounted) {
       setState(() {
@@ -478,7 +480,15 @@ class _ClientScreenState extends State<ClientScreen> {
     final double actual = _position.positionMs;
     final double error = expected - actual;
 
-    _updateRate(error);
+    final double now = Monotonic.nowMs();
+    final double dt = _lastErrorAtMs > 0 ? (now - _lastErrorAtMs) / 1000.0 : 0.2;
+    _lastErrorAtMs = now;
+
+    // The position measurement carries a couple of milliseconds of jitter, so
+    // the controller works on a lightly filtered error. A slow drift is not
+    // affected by the filter.
+    _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
+    _updateIntegral(_filteredErrorMs, dt);
 
     if (mounted && (error - _lastErrorMs).abs() > 1.0) {
       setState(() => _lastErrorMs = error);
@@ -493,6 +503,7 @@ class _ClientScreenState extends State<ClientScreen> {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
         _position.reset(expected);
+        _resetController();
         if (_speed != 1.0) {
           _speed = 1.0;
           _position.setSpeed(1.0);
@@ -505,23 +516,34 @@ class _ClientScreenState extends State<ClientScreen> {
     // Smooth rate trim: no clicks, no audible pitch change.
     // After a periodic check flagged a drift, pull in harder for a few seconds.
     final bool aggressive = Monotonic.nowMs() < _aggressiveUntilMs;
-    _applyTrim(error, aggressive: aggressive);
+    _applyTrim(_filteredErrorMs, aggressive: aggressive);
   }
 
-  /// Estimates how fast the phase error is growing (ms of drift per ms of
-  /// time). This is the difference between the two phones' crystal clocks and
-  /// is what the integral term of the controller cancels.
-  void _updateRate(double error) {
-    final double now = Monotonic.nowMs();
-    if (_lastErrorAtMs > 0) {
-      final double dt = now - _lastErrorAtMs;
-      if (dt > 1000) {
-        final double d = (error - _prevErrorMs) / dt;
-        _rateEstimate = _rateEstimate * 0.7 + d * 0.3;
-      }
+  /// Clears the controller state (after a seek or a new start).
+  void _resetController() {
+    _integral = 0;
+    _prevErrorSign = 0;
+    _lastErrorAtMs = 0;
+    _filteredErrorMs = 0;
+  }
+
+  /// Integrates the phase error so that a constant disturbance - the
+  /// difference between the two phones' crystal clocks - is cancelled without
+  /// the error having to grow first.
+  ///
+  /// The sign-consistency check keeps measurement noise out: noise changes
+  /// sign from sample to sample, a real drift does not.
+  void _updateIntegral(double error, double dtSec) {
+    final double sign = error.sign;
+    final bool consistent = sign == _prevErrorSign;
+    _prevErrorSign = sign;
+
+    if (error.abs() > 1.0 && consistent) {
+      _integral += Pll.integralGain * error * dtSec;
     }
-    _prevErrorMs = error;
-    _lastErrorAtMs = now;
+    // Slow leak so a stale bias cannot stick.
+    _integral *= 0.9995;
+    _integral = _integral.clamp(-Pll.maxIntegral, Pll.maxIntegral);
   }
 
   /// Periodic (5 s) sync check. If this phone has drifted noticeably out of
@@ -543,6 +565,7 @@ class _ClientScreenState extends State<ClientScreen> {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
         _position.reset(expected);
+        _resetController();
         if (_speed != 1.0) {
           _speed = 1.0;
           _position.setSpeed(1.0);
@@ -555,14 +578,14 @@ class _ClientScreenState extends State<ClientScreen> {
     if (error.abs() > Pll.deadbandMs * 2) {
       // Pull in harder for the next few seconds so the phone locks on quickly.
       _aggressiveUntilMs = Monotonic.nowMs() + 4000;
-      _applyTrim(error, aggressive: true);
+      _applyTrim(_filteredErrorMs, aggressive: true);
     }
   }
 
   void _applyTrim(double error, {required bool aggressive}) {
     final double target = Pll.speedFor(
       error,
-      rateError: _rateEstimate,
+      integral: _integral,
       aggressive: aggressive,
     );
     if ((target - _speed).abs() > 0.0002) {
