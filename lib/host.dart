@@ -20,9 +20,11 @@ class Peer {
   String name;
   bool ready;
   int progress;
+  double errorMs;
   Peer(this.socket, this.name)
       : ready = false,
-        progress = 0;
+        progress = 0,
+        errorMs = 0;
 }
 
 class HostScreen extends StatefulWidget {
@@ -182,6 +184,7 @@ class _HostScreenState extends State<HostScreen> {
           setState(() {
             peer.ready = msg['ready'] == true;
             peer.progress = (msg['progress'] as num?)?.toInt() ?? 0;
+            peer.errorMs = (msg['errorMs'] as num?)?.toDouble() ?? 0.0;
           });
         }
         break;
@@ -523,7 +526,11 @@ class _HostScreenState extends State<HostScreen> {
                                 : const Color(0xFFFBBF24),
                           ),
                           label: Text(
-                            p.ready ? p.name : '${p.name} ${p.progress}%',
+                            p.ready
+                                ? '${p.name} '
+                                    '${p.errorMs >= 0 ? "+" : ""}'
+                                    '${p.errorMs.toStringAsFixed(0)}ms'
+                                : '${p.name} ${p.progress}%',
                             style: const TextStyle(fontSize: 12),
                           ),
                         );

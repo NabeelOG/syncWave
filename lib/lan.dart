@@ -12,15 +12,39 @@ class FoundHost {
   const FoundHost(this.name, this.ip, this.port);
 }
 
+/// Gateways of the hotspot flavours Android/iOS/Windows use. A phone that runs
+/// a Personal Hotspot *is* the gateway, so its party is always reachable at one
+/// of these addresses.
+const List<String> kHotspotGateways = [
+  '192.168.43.1', // Android
+  '192.168.137.1', // Windows mobile hotspot
+  '172.20.10.1', // iPhone
+  '192.168.49.1', // some Android builds
+  '192.168.147.1', // some Samsung builds
+  '192.168.155.1', // some Samsung builds
+];
+
 /// Finds SyncWave hosts on the local network.
 ///
 /// Works for both scenarios:
 ///  * both phones on the same Wi-Fi router (host is in the same /24)
-///  * host phone runs a Personal Hotspot (host is the gateway, e.g. 192.168.43.1)
+///  * host phone runs a Personal Hotspot (host is the gateway)
 ///
-/// Only a plain HTTP GET is used, so no extra permissions or sockets are needed.
-Future<List<FoundHost>> findHosts(List<String> myIps) async {
+/// Only a plain HTTP GET is used, so no extra permissions or sockets are
+/// needed.
+///
+/// The sweep runs [rounds] times: the first attempt on an address usually
+/// fails because the ARP entry is not cached yet, so a second pass is what
+/// actually finds the host.
+Future<List<FoundHost>> findHosts(
+  List<String> myIps, {
+  int rounds = 2,
+}) async {
   final candidates = <String>{};
+
+  // Hotspot gateways first: they are the most likely host address and should
+  // be probed in the very first batch.
+  candidates.addAll(kHotspotGateways);
 
   // Same-router setups: every host address on my own subnet.
   for (final ip in myIps) {
@@ -32,24 +56,17 @@ Future<List<FoundHost>> findHosts(List<String> myIps) async {
     }
   }
 
-  // Hotspot setups: the host phone is the gateway of these subnets.
-  for (final subnet in const ['192.168.43', '192.168.137', '172.20.10']) {
-    for (int i = 1; i <= 254; i++) {
-      candidates.add('$subnet.$i');
-    }
-  }
-
   final found = <String, FoundHost>{};
   final list = candidates.toList();
 
   Future<void> probe(String ip) async {
     final client = HttpClient()
-      ..connectionTimeout = const Duration(milliseconds: 250);
+      ..connectionTimeout = const Duration(milliseconds: 300);
     try {
       final req = await client
-          .getUrl(Uri.parse('http://$ip:8080/ping'))
-          .timeout(const Duration(milliseconds: 350));
-      final resp = await req.close().timeout(const Duration(milliseconds: 450));
+          .getUrl(Uri.parse('http://$ip:$kPort/ping'))
+          .timeout(const Duration(milliseconds: 400));
+      final resp = await req.close().timeout(const Duration(milliseconds: 500));
       if (resp.statusCode != 200) return;
       final body = await resp.transform(utf8.decoder).join();
       final data = jsonDecode(body) as Map<String, dynamic>;
@@ -57,7 +74,7 @@ Future<List<FoundHost>> findHosts(List<String> myIps) async {
       found[ip] = FoundHost(
         (data['name'] as String?) ?? 'Party Host',
         ip,
-        (data['port'] as num?)?.toInt() ?? 8080,
+        (data['port'] as num?)?.toInt() ?? kPort,
       );
     } catch (_) {
     } finally {
@@ -65,9 +82,16 @@ Future<List<FoundHost>> findHosts(List<String> myIps) async {
     }
   }
 
-  const batch = 96;
-  for (int i = 0; i < list.length; i += batch) {
-    await Future.wait(list.skip(i).take(batch).map(probe));
+  const batch = 64;
+  for (int round = 0; round < rounds; round++) {
+    for (int i = 0; i < list.length; i += batch) {
+      await Future.wait(list.skip(i).take(batch).map(probe));
+    }
+    // Give the network a moment (and the ARP cache time to fill) before the
+    // next pass - the second pass is the one that usually finds the host.
+    if (round < rounds - 1) {
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
   }
 
   return found.values.toList();

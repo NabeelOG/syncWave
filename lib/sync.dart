@@ -76,15 +76,22 @@ class ClockSync {
 ///   |error| <= 5 ms   -> locked, play at exactly 1.000x
 ///   5..300 ms         -> proportional speed trim of at most +/-1.5%
 ///   > 300 ms          -> hard re-seek (stall, late join, ...)
+///
+/// The 5 second periodic check uses the aggressive variant, which pulls in
+/// faster (up to +/-3%) so a phone that started out of sync locks on within a
+/// couple of seconds instead of ten.
 class Pll {
   static const double deadbandMs = 5.0;
   static const double hardSeekMs = 300.0;
   static const double maxTrim = 0.015; // 1.5% -> ~26 cents, barely audible
+  static const double maxAggressiveTrim = 0.03; // 3% -> ~52 cents, brief
 
   /// Speed to apply for the given phase error (expected - actual, ms).
-  static double speedFor(double errorMs) {
+  static double speedFor(double errorMs, {bool aggressive = false}) {
     if (errorMs.abs() <= deadbandMs) return 1.0;
-    final double trim = (0.0012 * errorMs).clamp(-maxTrim, maxTrim);
+    final double gain = aggressive ? 0.003 : 0.0012;
+    final double cap = aggressive ? maxAggressiveTrim : maxTrim;
+    final double trim = (gain * errorMs).clamp(-cap, cap);
     return 1.0 + trim;
   }
 

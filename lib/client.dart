@@ -59,6 +59,12 @@ class _ClientScreenState extends State<ClientScreen> {
   // Timestamp of the last hard seek, used to rate-limit audible corrections.
   double _lastSeekAtMs = 0;
 
+  // Last measured phase error against the host (ms), shown in the UI.
+  double _lastErrorMs = 0;
+
+  // Deadline until which the drift correction uses the stronger gain.
+  double _aggressiveUntilMs = 0;
+
   /// How much earlier this phone must start than the host so that the sound
   /// leaves both speakers at the same moment:
   ///   (my output latency - host output latency) + manual nudge
@@ -71,6 +77,8 @@ class _ClientScreenState extends State<ClientScreen> {
   Timer? _pll;
   Timer? _keepAlive;
   Timer? _startTimer;
+  Timer? _searchTimer;
+  Timer? _syncCheckTimer;
   Future<void> _msgChain = Future<void>.value();
 
   @override
@@ -82,13 +90,25 @@ class _ClientScreenState extends State<ClientScreen> {
       const Duration(milliseconds: 200),
       (_) => _tick(),
     );
+    _syncCheckTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _syncCheck(),
+    );
 
     final auto = widget.autoJoinIp;
     if (auto != null && auto.isNotEmpty) {
       // Deep link: we already know the host, no need to scan the network.
       WidgetsBinding.instance.addPostFrameCallback((_) => _connect(auto));
     } else {
-      _search();
+      _search(thorough: true);
+      // Keep looking: the host may start later, or the Wi-Fi may still have
+      // been associating when the first sweep ran.
+      _searchTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) {
+          if (!_connected) _search();
+        },
+      );
     }
   }
 
@@ -105,20 +125,25 @@ class _ClientScreenState extends State<ClientScreen> {
     _latencyOffsetMs = (_myLatencyMs - _hostLatencyMs) + _nudgeMs.toDouble();
   }
 
-  Future<void> _search() async {
+  /// Scans the network for a host.
+  /// [thorough] runs a second pass - the first attempt on an address usually
+  /// fails because the ARP entry is not cached yet.
+  Future<void> _search({bool thorough = false}) async {
     if (_searching) return;
     setState(() {
       _searching = true;
       _error = null;
     });
 
+    // Read the local addresses again every time: the Wi-Fi may have just been
+    // associated, in which case the first sweep had nothing to work with.
     final ips = await lanIps();
-    final hosts = await findHosts(ips);
+    final hosts = await findHosts(ips, rounds: thorough ? 2 : 1);
 
     if (mounted) {
       setState(() {
         _myIps = ips;
-        _hosts = hosts;
+        if (hosts.isNotEmpty) _hosts = hosts;
         _searching = false;
       });
     }
@@ -274,6 +299,7 @@ class _ClientScreenState extends State<ClientScreen> {
       'type': 'status',
       'ready': _ready,
       'progress': _percent,
+      'errorMs': _lastErrorMs,
     }));
   }
 
@@ -414,6 +440,10 @@ class _ClientScreenState extends State<ClientScreen> {
     final double actual = _player.position.inMilliseconds.toDouble();
     final double error = expected - actual;
 
+    if (mounted && (error - _lastErrorMs).abs() > 1.0) {
+      setState(() => _lastErrorMs = error);
+    }
+
     // A hard seek is audible, so it is only used for a real desync and never
     // twice in a row (the constant offset between two phones must not trigger
     // it, otherwise the audio turns into chopping).
@@ -431,7 +461,46 @@ class _ClientScreenState extends State<ClientScreen> {
     }
 
     // Smooth rate trim: no clicks, no audible pitch change.
-    final double target = Pll.speedFor(error);
+    // After a periodic check flagged a drift, pull in harder for a few seconds.
+    final bool aggressive = Monotonic.nowMs() < _aggressiveUntilMs;
+    _applyTrim(error, aggressive: aggressive);
+  }
+
+  /// Periodic (5 s) sync check. If this phone has drifted noticeably out of
+  /// phase it pulls in harder than the continuous loop so it locks on within
+  /// a couple of seconds instead of slowly creeping back.
+  void _syncCheck() {
+    if (!_playing || !_player.playing || !_ready) return;
+    final double elapsed = (_clock.hostNowMs() - _startAtMs) / 1000.0;
+    if (elapsed < 0.5) return;
+
+    final double expected =
+        (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
+    final double actual = _player.position.inMilliseconds.toDouble();
+    final double error = expected - actual;
+
+    if (Pll.needsHardSeek(error)) {
+      final double now = Monotonic.nowMs();
+      if (now - _lastSeekAtMs > 2000) {
+        _lastSeekAtMs = now;
+        _player.seek(Duration(milliseconds: expected.round()));
+        if (_speed != 1.0) {
+          _speed = 1.0;
+          _player.setSpeed(1.0);
+        }
+      }
+      return;
+    }
+
+    if (error.abs() > Pll.deadbandMs * 2) {
+      // Pull in harder for the next few seconds so the phone locks on quickly.
+      _aggressiveUntilMs = Monotonic.nowMs() + 4000;
+      _applyTrim(error, aggressive: true);
+    }
+  }
+
+  void _applyTrim(double error, {required bool aggressive}) {
+    final double target = Pll.speedFor(error, aggressive: aggressive);
     if ((target - _speed).abs() > 0.0002) {
       _speed = target;
       _player.setSpeed(target);
@@ -458,6 +527,8 @@ class _ClientScreenState extends State<ClientScreen> {
     _pll?.cancel();
     _keepAlive?.cancel();
     _startTimer?.cancel();
+    _searchTimer?.cancel();
+    _syncCheckTimer?.cancel();
     _ws?.close();
     _ipInput.dispose();
     _player.dispose();
@@ -543,7 +614,7 @@ class _ClientScreenState extends State<ClientScreen> {
 
         const SizedBox(height: 8),
         OutlinedButton.icon(
-          onPressed: _searching ? null : _search,
+          onPressed: _searching ? null : () => _search(thorough: true),
           icon: const Icon(Icons.radar_rounded),
           label: const Text('Search Again'),
         ),
@@ -626,6 +697,36 @@ class _ClientScreenState extends State<ClientScreen> {
           ),
         ],
       ],
+    );
+  }
+
+  /// Shows how far this phone currently is from the host.
+  Widget _syncBadge() {
+    final double err = _lastErrorMs;
+    final bool locked = err.abs() <= Pll.deadbandMs;
+    final Color color = locked
+        ? const Color(0xFF34D399)
+        : err.abs() <= 25
+            ? const Color(0xFFFBBF24)
+            : const Color(0xFFF87171);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(99),
+      ),
+      child: Text(
+        locked
+            ? 'LOCKED  ±${err.abs().toStringAsFixed(1)} ms'
+            : 'SYNCING  ${err >= 0 ? "+" : ""}${err.toStringAsFixed(0)} ms',
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+          fontFamily: 'monospace',
+        ),
+      ),
     );
   }
 
@@ -716,13 +817,21 @@ class _ClientScreenState extends State<ClientScreen> {
                 const SizedBox(height: 10),
                 Text('Loading song... $_percent%'),
               ] else
-                Text(
-                  _playing
-                      ? 'Playing in sync'
-                      : _ready
-                          ? 'Ready — waiting for the host'
-                          : 'Connected — waiting for the host',
-                  style: const TextStyle(color: Color(0xFF34D399)),
+                Column(
+                  children: [
+                    Text(
+                      _playing
+                          ? 'Playing in sync'
+                          : _ready
+                              ? 'Ready — waiting for the host'
+                              : 'Connected — waiting for the host',
+                      style: const TextStyle(color: Color(0xFF34D399)),
+                    ),
+                    if (_playing) ...[
+                      const SizedBox(height: 6),
+                      _syncBadge(),
+                    ],
+                  ],
                 ),
               const SizedBox(height: 24),
               _nudgeControl(),
