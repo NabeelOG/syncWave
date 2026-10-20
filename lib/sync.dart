@@ -118,6 +118,9 @@ class ClockSync {
 
   bool get locked => _own.hasSamples || _reverseDeltaMs != null;
 
+  /// Current time expressed on the Host's clock.
+  double hostNowMs() => Monotonic.nowMs() + offsetMs;
+
   void reset() {
     _own.reset();
     _reverseDeltaMs = null;
