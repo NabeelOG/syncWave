@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import 'client.dart';
 import 'host.dart';
+import 'sync.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -129,6 +130,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 'Play one song on every phone at the same time.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 15, color: Colors.white60),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'v$kAppVersion',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11, color: Colors.white24),
               ),
               const SizedBox(height: 34),
               TextField(

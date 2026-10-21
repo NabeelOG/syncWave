@@ -217,7 +217,11 @@ class _ClientScreenState extends State<ClientScreen> {
       final ws = await WebSocket.connect('ws://$ip:$_hostPort/ws')
           .timeout(const Duration(seconds: 6));
       _ws = ws;
-      ws.add(jsonEncode({'type': 'hello', 'name': widget.deviceName}));
+      ws.add(jsonEncode({
+        'type': 'hello',
+        'name': widget.deviceName,
+        'version': kAppVersion,
+      }));
 
       ws.listen(
         (data) {
@@ -572,8 +576,24 @@ class _ClientScreenState extends State<ClientScreen> {
       _rateClockDelta = 0;
     }
 
-    _hostAnchorPosMs = hostPosMs;
-    _hostAnchorAtMs = hostAtMs;
+    // Move our reference towards the host's playhead instead of snapping to
+    // it: a snapped reference would jump the phase error on every message.
+    final double measuredNow =
+        hostPosMs + (_clock.hostNowMs() - hostAtMs) * _hostRate;
+
+    if (_hostAnchorAtMs <= 0) {
+      _hostAnchorPosMs = measuredNow;
+      _hostAnchorAtMs = _clock.hostNowMs();
+    } else {
+      final double current = _hostExpectedPosMs();
+      final double diff = measuredNow - current;
+      // While playing, correct at most 10 ms per message (20 ms/s). Before
+      // playback starts there is nothing to hear, so snap immediately.
+      final double step = _playing ? 10.0 : 100000.0;
+      _hostAnchorPosMs = current + diff.clamp(-step, step);
+      _hostAnchorAtMs = _clock.hostNowMs();
+    }
+
     _hostAnchorClientPos = clientPos;
   }
 
@@ -861,6 +881,24 @@ class _ClientScreenState extends State<ClientScreen> {
     );
   }
 
+  /// Small readout of the values the sync loop is built on, so a jumping
+  /// component is visible instead of guessed.
+  Widget _diagnostics() {
+    final String rtt = _clock.locked && _clock.minRttMs < 9000
+        ? '${_clock.minRttMs.toStringAsFixed(0)}ms'
+        : '--';
+    return Text(
+      'clk ${_clock.offsetMs.toStringAsFixed(1)}ms  ·  rtt $rtt  ·  '
+      'rate ${_hostRate.toStringAsFixed(4)}  ·  v$kAppVersion',
+      style: const TextStyle(
+        fontSize: 10,
+        color: Colors.white30,
+        fontFamily: 'monospace',
+      ),
+      textAlign: TextAlign.center,
+    );
+  }
+
   /// Fine tuning control: shifts this phone relative to the host.
   /// Positive values make this phone play earlier.
   Widget _nudgeControl() {
@@ -961,6 +999,8 @@ class _ClientScreenState extends State<ClientScreen> {
                     if (_playing) ...[
                       const SizedBox(height: 6),
                       _syncBadge(),
+                      const SizedBox(height: 6),
+                      _diagnostics(),
                     ],
                   ],
                 ),

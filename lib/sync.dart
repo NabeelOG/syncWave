@@ -1,6 +1,9 @@
 import 'dart:io';
 import 'dart:math';
 
+/// Shown in the UI so it is obvious when two phones run different builds.
+const String kAppVersion = '2.1.1';
+
 /// Monotonic clock (microsecond resolution, immune to wall-clock changes).
 class Monotonic {
   static final Stopwatch _sw = Stopwatch()..start();
@@ -101,13 +104,13 @@ class ClockSync {
   double? _reverseDeltaMs;
   double _reverseRttMs = 1e9;
 
-  double get offsetMs {
-    final own = _own.offsetMs;
-    if (_reverseDeltaMs != null && _reverseRttMs < _own.minRttMs) {
-      return _reverseDeltaMs!;
-    }
-    return own;
-  }
+  // The offset actually in use. It is slewed towards the target estimate and
+  // never switched abruptly: this value feeds hostNowMs(), so a jump here
+  // would jump the expected playhead and make the phase error oscillate.
+  double _offsetMs = 0;
+  bool _hasOffset = false;
+
+  double get offsetMs => _offsetMs;
 
   double get minRttMs {
     if (_reverseDeltaMs != null && _reverseRttMs < _own.minRttMs) {
@@ -116,15 +119,17 @@ class ClockSync {
     return _own.minRttMs;
   }
 
-  bool get locked => _own.hasSamples || _reverseDeltaMs != null;
+  bool get locked => _hasOffset;
 
   /// Current time expressed on the Host's clock.
-  double hostNowMs() => Monotonic.nowMs() + offsetMs;
+  double hostNowMs() => Monotonic.nowMs() + _offsetMs;
 
   void reset() {
     _own.reset();
     _reverseDeltaMs = null;
     _reverseRttMs = 1e9;
+    _offsetMs = 0;
+    _hasOffset = false;
   }
 
   /// A sample measured by this device pinging the Host.
@@ -132,6 +137,7 @@ class ClockSync {
     final rtt = (t4 - t1) - (t3 - t2);
     final offset = ((t2 - t1) + (t3 - t4)) / 2.0;
     _own.add(rtt, offset);
+    _refreshOffset();
   }
 
   /// The Host's estimate of the same offset, measured in the other direction.
@@ -139,6 +145,36 @@ class ClockSync {
     if (rttMs < 0 || rttMs > 1000) return;
     _reverseDeltaMs = deltaMs;
     _reverseRttMs = rttMs;
+    _refreshOffset();
+  }
+
+  /// Picks the most trustworthy estimate (the direction with the lower delay)
+  /// and moves the offset towards it smoothly.
+  void _refreshOffset() {
+    final double target = _pickTarget();
+    if (!_hasOffset) {
+      _offsetMs = target;
+      _hasOffset = true;
+      return;
+    }
+
+    final double delta = target - _offsetMs;
+    if (delta.abs() > 50) {
+      // More than 50 ms apart means the estimate was genuinely wrong (e.g. the
+      // network changed): accept it, otherwise followers would never recover.
+      _offsetMs = target;
+    } else {
+      // Slew: at most 5 ms per sample (samples arrive ~2 s apart).
+      _offsetMs += delta.clamp(-5.0, 5.0);
+    }
+  }
+
+  double _pickTarget() {
+    final own = _own.offsetMs;
+    if (_reverseDeltaMs != null && _reverseRttMs < _own.minRttMs) {
+      return _reverseDeltaMs!;
+    }
+    return own;
   }
 }
 

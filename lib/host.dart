@@ -19,11 +19,13 @@ class Peer {
   final WebSocket socket;
   final OffsetEstimator reverse = OffsetEstimator();
   String name;
+  String version;
   bool ready;
   int progress;
   double errorMs;
   Peer(this.socket, this.name)
-      : ready = false,
+      : version = '',
+        ready = false,
         progress = 0,
         errorMs = 0;
 }
@@ -229,8 +231,10 @@ class _HostScreenState extends State<HostScreen> {
       case 'hello':
         if (mounted) {
           final name = (msg['name'] as String?)?.trim();
+          final version = (msg['version'] as String?)?.trim();
           setState(() {
             if (name != null && name.isNotEmpty) peer.name = name;
+            if (version != null) peer.version = version;
           });
         }
         break;
@@ -602,6 +606,7 @@ class _HostScreenState extends State<HostScreen> {
                                 ? '${p.name} '
                                     '${p.errorMs >= 0 ? "+" : ""}'
                                     '${p.errorMs.toStringAsFixed(0)}ms'
+                                    '${p.version.isNotEmpty && p.version != kAppVersion ? " ⚠ v${p.version}" : ""}'
                                 : '${p.name} ${p.progress}%',
                             style: const TextStyle(fontSize: 12),
                           ),
