@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 
 /// Access to the parts of the audio path that Flutter cannot see directly.
@@ -12,8 +14,13 @@ import 'package:flutter/services.dart';
 class DeviceAudio {
   static const MethodChannel _channel = MethodChannel('syncwave/device');
 
+  /// True when the platform can report an output latency. On iOS there is no
+  /// equivalent value yet, so the estimate is 0 and the manual nudge is used.
+  static bool get _supported => Platform.isAndroid;
+
   /// Estimated output latency of this phone in milliseconds (0 if unknown).
   static Future<double> outputLatencyMs() async {
+    if (!_supported) return 0.0;
     try {
       final double value =
           await _channel.invokeMethod<double>('outputLatencyMs') ?? 0.0;
@@ -25,6 +32,7 @@ class DeviceAudio {
 
   /// Manual per-device nudge in milliseconds (persisted on the device).
   static Future<int> nudgeMs() async {
+    if (!_supported) return 0;
     try {
       return await _channel.invokeMethod<int>('getOffsetMs') ?? 0;
     } catch (_) {
@@ -33,6 +41,7 @@ class DeviceAudio {
   }
 
   static Future<void> setNudgeMs(int value) async {
+    if (!_supported) return;
     try {
       await _channel.invokeMethod<void>('setOffsetMs', {'value': value});
     } catch (_) {}

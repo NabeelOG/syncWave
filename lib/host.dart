@@ -69,14 +69,11 @@ class _HostScreenState extends State<HostScreen> {
   Timer? _pll;
   Timer? _startTimer;
   Timer? _clockPingTimer;
+  Timer? _syncTimer;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration?>? _durSub;
 
-  // Integral term of the drift controller and the sign of the previous error
-  // (used to tell a real drift apart from measurement noise).
-  double _integral = 0;
-  double _prevErrorSign = 0;
-  double _lastErrorAtMs = 0;
+  // Filtered phase error used by the proportional correction.
   double _filteredErrorMs = 0;
 
   @override
@@ -120,6 +117,17 @@ class _HostScreenState extends State<HostScreen> {
         for (final peer in _peers.values) {
           peer.socket.add(jsonEncode({'type': 'ping2', 't1h': now}));
         }
+      });
+
+      // Publish the actual playhead so the clients follow what this phone is
+      // really playing instead of a shared schedule. Without this the two
+      // controllers pull against each other.
+      _syncTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+        _broadcast({
+          'type': 'sync',
+          'posMs': _position.positionMs,
+          'atMs': Monotonic.nowMs(),
+        });
       });
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
@@ -346,9 +354,6 @@ class _HostScreenState extends State<HostScreen> {
     });
 
     _startTimer?.cancel();
-    _integral = 0;
-    _prevErrorSign = 0;
-    _lastErrorAtMs = 0;
     _filteredErrorMs = 0;
     setState(() {
       _playing = true;
@@ -399,35 +404,16 @@ class _HostScreenState extends State<HostScreen> {
     if (elapsed < 0.5) return;
 
     final double expected = (_startPosSec + elapsed) * 1000.0;
-    final double actual = _position.positionMs;
-    final double error = expected - actual;
-
-    final double now = Monotonic.nowMs();
-    final double dt = _lastErrorAtMs > 0 ? (now - _lastErrorAtMs) / 1000.0 : 0.2;
-    _lastErrorAtMs = now;
-
-    // Integral term: cancels the constant difference between this phone's
-    // crystal clock and the room's timeline. The sign-consistency check keeps
-    // measurement noise out (noise flips sign, a real drift does not).
-    _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
-    final double sign = _filteredErrorMs.sign;
-    if (_filteredErrorMs.abs() > 1.0 && sign == _prevErrorSign) {
-      _integral += Pll.integralGain * _filteredErrorMs * dt;
-    }
-    _prevErrorSign = sign;
-    _integral *= 0.9995;
-    _integral = _integral.clamp(-Pll.maxIntegral, Pll.maxIntegral);
+    final double error = expected - _position.positionMs;
 
     // Hard seeks are audible: only use them for a real desync and rate-limit
     // them so the audio never turns into chopping.
+    final double now = Monotonic.nowMs();
     if (Pll.needsHardSeek(error)) {
       if (now - _lastSeekAtMs > 2000) {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
         _position.reset(expected);
-        _integral = 0;
-        _prevErrorSign = 0;
-        _filteredErrorMs = 0;
         if (_speed != 1.0) {
           _speed = 1.0;
           _position.setSpeed(1.0);
@@ -437,14 +423,22 @@ class _HostScreenState extends State<HostScreen> {
       return;
     }
 
-    // Smooth rate trim: no clicks, no audible pitch change.
-    final double target =
-        Pll.speedFor(_filteredErrorMs, integral: _integral);
-    if ((target - _speed).abs() > 0.0002) {
-      _speed = target;
-      _position.setSpeed(target);
-      _player.setSpeed(target);
-    }
+    // Proportional phase correction only - a P loop on a position plant is
+    // stable and cannot ring.
+    _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
+    _applySpeed(1.0 + Pll.phaseTrim(_filteredErrorMs));
+  }
+
+  /// Applies a target speed, but never changes it by more than
+  /// [Pll.maxSpeedStep] at once: a step in the playback rate is audible.
+  void _applySpeed(double target) {
+    final double limited =
+        (_speed + (target - _speed).clamp(-Pll.maxSpeedStep, Pll.maxSpeedStep))
+            .clamp(0.97, 1.03);
+    if ((limited - _speed).abs() < 0.00002) return;
+    _speed = limited;
+    _position.setSpeed(limited);
+    _player.setSpeed(limited);
   }
 
   String _fmt(Duration d) {
@@ -458,6 +452,7 @@ class _HostScreenState extends State<HostScreen> {
     _pll?.cancel();
     _startTimer?.cancel();
     _clockPingTimer?.cancel();
+    _syncTimer?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();
     _server?.close(force: true);

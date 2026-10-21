@@ -158,15 +158,21 @@ class ClockSync {
 ///   rate term   - cancels the difference between the two crystal clocks
 ///                 (100 ppm would be 24 ms over four minutes)
 ///
-/// The controller is a PI controller:
+/// The controller has two parts that act on different things:
 ///
-///   phase term    - pulls the playhead onto the host's timeline (transient)
-///   integral term - accumulates the phase error and therefore cancels a
-///                   constant disturbance such as the difference between the
-///                   two crystal clocks (100 ppm = 24 ms over four minutes)
-///                   *without* the error having to grow first
+///   phase term  - a proportional correction of the *position* error. A
+///                 proportional loop on a position plant is a stable
+///                 first-order system, so it cannot ring.
 ///
-///   |error| <= deadband -> no phase term, but the integral keeps holding
+///   rate term   - a feedforward of the *speed*. The difference between two
+///                 phones' crystal clocks (100 ppm = 24 ms over four minutes)
+///                 is a rate error, and it is measured directly: the Host
+///                 publishes its playhead, the client sees how far it advanced
+///                 in the same window and trims its base speed so that both
+///                 advance at exactly the same rate. A feedforward is not a
+///                 feedback loop, so it cannot fight the phase term.
+///
+///   |error| <= deadband -> no phase term
 ///   > 300 ms            -> hard re-seek (stall, late join, ...)
 class Pll {
   /// Phase errors below this are measurement noise, so the phase term is off.
@@ -174,23 +180,18 @@ class Pll {
   static const double hardSeekMs = 300.0;
 
   static const double maxTrim = 0.015; // 1.5% -> ~26 cents, barely audible
-  static const double maxIntegral = 0.008; // 0.8%
   static const double gain = 0.0006; // per ms of phase error
-  static const double integralGain = 0.00008; // per ms*s of accumulated error
 
-  /// Speed for the given phase error (expected - actual, ms) and the
-  /// accumulated integral term.
-  static double speedFor(
-    double errorMs, {
-    double integral = 0.0,
-    bool aggressive = false,
-  }) {
+  /// Maximum speed change per control tick. Keeps the playback from stepping
+  /// (a step sounds like a click).
+  static const double maxSpeedStep = 0.0005; // 0.05%
+
+  /// Proportional correction for the given phase error (expected - actual, ms).
+  static double phaseTrim(double errorMs, {bool aggressive = false}) {
+    if (errorMs.abs() <= deadbandMs) return 0.0;
     final double cap = aggressive ? 0.03 : maxTrim;
     final double g = aggressive ? gain * 2.5 : gain;
-    final double phase =
-        errorMs.abs() <= deadbandMs ? 0.0 : (g * errorMs).clamp(-cap, cap);
-    final double i = integral.clamp(-maxIntegral, maxIntegral);
-    return 1.0 + phase + i;
+    return (g * errorMs).clamp(-cap, cap);
   }
 
   static bool needsHardSeek(double errorMs) => errorMs.abs() > hardSeekMs;

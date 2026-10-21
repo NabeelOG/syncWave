@@ -68,10 +68,20 @@ class _ClientScreenState extends State<ClientScreen> {
 
   // Integral term of the drift controller and the sign of the previous error
   // (used to tell a real drift apart from measurement noise).
-  double _integral = 0;
-  double _prevErrorSign = 0;
-  double _lastErrorAtMs = 0;
   double _filteredErrorMs = 0;
+
+  // Rate matching: the base speed is trimmed so that this phone advances at
+  // exactly the same rate as the host's playhead.
+  double _baseSpeed = 1.0;
+  double _hostRate = 1.0;
+  double _rateHostDelta = 0;
+  double _rateClientDelta = 0;
+  double _rateClockDelta = 0;
+
+  // The host's last published playhead and the clock time it was taken at.
+  double _hostAnchorPosMs = 0;
+  double _hostAnchorAtMs = 0;
+  double _hostAnchorClientPos = 0;
 
   /// How much earlier this phone must start than the host so that the sound
   /// leaves both speakers at the same moment:
@@ -286,6 +296,14 @@ class _ClientScreenState extends State<ClientScreen> {
         );
         break;
 
+      case 'sync':
+        // The host published its actual playhead.
+        _onHostSync(
+          (msg['posMs'] as num).toDouble(),
+          (msg['atMs'] as num).toDouble(),
+        );
+        break;
+
       case 'load':
         final trackId = (msg['trackId'] as String?) ?? '';
         final title = (msg['title'] as String?) ?? 'Shared song';
@@ -472,23 +490,17 @@ class _ClientScreenState extends State<ClientScreen> {
 
   void _keepInSync() {
     if (!_playing || !_player.playing || !_ready) return;
-    final double elapsed = (_clock.hostNowMs() - _startAtMs) / 1000.0;
-    if (elapsed < 0.5) return;
+    if (_hostAnchorAtMs <= 0) return; // no playhead received from the host yet
 
-    final double expected =
-        (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
-    final double actual = _position.positionMs;
-    final double error = expected - actual;
-
-    final double now = Monotonic.nowMs();
-    final double dt = _lastErrorAtMs > 0 ? (now - _lastErrorAtMs) / 1000.0 : 0.2;
-    _lastErrorAtMs = now;
+    // The reference is the host's *actual* playhead, not the schedule. The two
+    // phones then follow the same audio instead of pulling against each other.
+    final double expected = _hostExpectedPosMs() + _latencyOffsetMs;
+    final double error = expected - _position.positionMs;
 
     // The position measurement carries a couple of milliseconds of jitter, so
     // the controller works on a lightly filtered error. A slow drift is not
     // affected by the filter.
     _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
-    _updateIntegral(_filteredErrorMs, dt);
 
     if (mounted && (error - _lastErrorMs).abs() > 1.0) {
       setState(() => _lastErrorMs = error);
@@ -513,37 +525,81 @@ class _ClientScreenState extends State<ClientScreen> {
       return;
     }
 
-    // Smooth rate trim: no clicks, no audible pitch change.
-    // After a periodic check flagged a drift, pull in harder for a few seconds.
+    // Proportional phase correction (a stable first order loop) on top of the
+    // rate matched base speed (a feedforward).
     final bool aggressive = Monotonic.nowMs() < _aggressiveUntilMs;
-    _applyTrim(_filteredErrorMs, aggressive: aggressive);
+    _applySpeed(
+      _baseSpeed + Pll.phaseTrim(_filteredErrorMs, aggressive: aggressive),
+    );
+  }
+
+  /// Where the host's playhead is right now, extrapolated from the last
+  /// position the host published.
+  double _hostExpectedPosMs() {
+    final double dt = _clock.hostNowMs() - _hostAnchorAtMs;
+    return _hostAnchorPosMs + dt * _hostRate;
+  }
+
+  /// The host published its playhead: remember it and use the window to
+  /// measure whether this phone advances at the same rate.
+  void _onHostSync(double hostPosMs, double hostAtMs) {
+    final double clientPos = _position.positionMs;
+
+    final double clockDelta = hostAtMs - _hostAnchorAtMs;
+    final double hostDelta = hostPosMs - _hostAnchorPosMs;
+    final double clientDelta = clientPos - _hostAnchorClientPos;
+
+    if (clockDelta > 0) {
+      // The host's content rate relative to its own clock.
+      _hostRate = _hostRate * 0.8 + (hostDelta / clockDelta) * 0.2;
+    }
+
+    // Accumulate a longer window before trimming the base speed: measuring the
+    // rate over 500 ms is too noisy, over a few seconds it is clean.
+    _rateHostDelta += hostDelta;
+    _rateClientDelta += clientDelta;
+    _rateClockDelta += clockDelta;
+
+    if (_rateClockDelta >= 3000 && _rateHostDelta > 500) {
+      final double hostRate = _rateHostDelta / _rateClockDelta;
+      final double clientRate = _rateClientDelta / _rateClockDelta;
+      // Trim the base speed so both phones advance at the same rate. This is a
+      // feedforward, so it cannot fight the phase correction.
+      _baseSpeed =
+          (_baseSpeed - (clientRate - hostRate) * 0.3).clamp(0.97, 1.03);
+      _rateHostDelta = 0;
+      _rateClientDelta = 0;
+      _rateClockDelta = 0;
+    }
+
+    _hostAnchorPosMs = hostPosMs;
+    _hostAnchorAtMs = hostAtMs;
+    _hostAnchorClientPos = clientPos;
+  }
+
+  /// Applies a target speed, but never changes it by more than
+  /// [Pll.maxSpeedStep] at once: a step in the playback rate is audible.
+  void _applySpeed(double target) {
+    final double limited =
+        (_speed + (target - _speed).clamp(-Pll.maxSpeedStep, Pll.maxSpeedStep))
+            .clamp(0.97, 1.03);
+    if ((limited - _speed).abs() < 0.00002) return;
+    _speed = limited;
+    _position.setSpeed(limited);
+    _player.setSpeed(limited);
   }
 
   /// Clears the controller state (after a seek or a new start).
   void _resetController() {
-    _integral = 0;
-    _prevErrorSign = 0;
-    _lastErrorAtMs = 0;
+    _baseSpeed = 1.0;
     _filteredErrorMs = 0;
-  }
-
-  /// Integrates the phase error so that a constant disturbance - the
-  /// difference between the two phones' crystal clocks - is cancelled without
-  /// the error having to grow first.
-  ///
-  /// The sign-consistency check keeps measurement noise out: noise changes
-  /// sign from sample to sample, a real drift does not.
-  void _updateIntegral(double error, double dtSec) {
-    final double sign = error.sign;
-    final bool consistent = sign == _prevErrorSign;
-    _prevErrorSign = sign;
-
-    if (error.abs() > 1.0 && consistent) {
-      _integral += Pll.integralGain * error * dtSec;
-    }
-    // Slow leak so a stale bias cannot stick.
-    _integral *= 0.9995;
-    _integral = _integral.clamp(-Pll.maxIntegral, Pll.maxIntegral);
+    _hostAnchorAtMs = 0;
+    _hostAnchorPosMs = 0;
+    _hostAnchorClientPos = 0;
+    _hostRate = 1.0;
+    _rateHostDelta = 0;
+    _rateClientDelta = 0;
+    _rateClockDelta = 0;
   }
 
   /// Periodic (5 s) sync check. If this phone has drifted noticeably out of
@@ -551,13 +607,10 @@ class _ClientScreenState extends State<ClientScreen> {
   /// a couple of seconds instead of slowly creeping back.
   void _syncCheck() {
     if (!_playing || !_player.playing || !_ready) return;
-    final double elapsed = (_clock.hostNowMs() - _startAtMs) / 1000.0;
-    if (elapsed < 0.5) return;
+    if (_hostAnchorAtMs <= 0) return;
 
-    final double expected =
-        (_startPosSec + elapsed) * 1000.0 + _latencyOffsetMs;
-    final double actual = _position.positionMs;
-    final double error = expected - actual;
+    final double expected = _hostExpectedPosMs() + _latencyOffsetMs;
+    final double error = expected - _position.positionMs;
 
     if (Pll.needsHardSeek(error)) {
       final double now = Monotonic.nowMs();
@@ -578,20 +631,9 @@ class _ClientScreenState extends State<ClientScreen> {
     if (error.abs() > Pll.deadbandMs * 2) {
       // Pull in harder for the next few seconds so the phone locks on quickly.
       _aggressiveUntilMs = Monotonic.nowMs() + 4000;
-      _applyTrim(_filteredErrorMs, aggressive: true);
-    }
-  }
-
-  void _applyTrim(double error, {required bool aggressive}) {
-    final double target = Pll.speedFor(
-      error,
-      integral: _integral,
-      aggressive: aggressive,
-    );
-    if ((target - _speed).abs() > 0.0002) {
-      _speed = target;
-      _position.setSpeed(target);
-      _player.setSpeed(target);
+      _applySpeed(
+        _baseSpeed + Pll.phaseTrim(_filteredErrorMs, aggressive: true),
+      );
     }
   }
 
