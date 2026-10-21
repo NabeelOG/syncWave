@@ -96,10 +96,15 @@ class _HostScreenState extends State<HostScreen> {
 
   Future<void> _start() async {
     try {
-      _outputLatencyMs = await DeviceAudio.outputLatencyMs();
+      // Bind first so friends can connect immediately; the latency
+      // measurement runs in the background and is published from then on.
       final server = await HttpServer.bind(InternetAddress.anyIPv4, kPort);
       _server = server;
       server.listen(_handleRequest);
+
+      DeviceAudio.outputLatencyMs().then((ms) {
+        if (mounted && ms > 0) setState(() => _outputLatencyMs = ms);
+      });
 
       final ips = await lanIps();
       if (mounted) {

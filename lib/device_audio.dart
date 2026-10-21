@@ -18,13 +18,20 @@ class DeviceAudio {
   /// equivalent value yet, so the estimate is 0 and the manual nudge is used.
   static bool get _supported => Platform.isAndroid;
 
-  /// Estimated output latency of this phone in milliseconds (0 if unknown).
+  /// Output latency of this phone in milliseconds (0 if unknown).
+  ///
+  /// Prefers the *measured* presentation latency (AudioTrack.getTimestamp),
+  /// which includes the DSP path, and falls back to the HAL buffer estimate.
   static Future<double> outputLatencyMs() async {
     if (!_supported) return 0.0;
     try {
-      final double value =
+      final double measured =
+          await _channel.invokeMethod<double>('measuredLatencyMs') ?? 0.0;
+      if (measured.isFinite && measured > 0) return measured;
+
+      final double estimate =
           await _channel.invokeMethod<double>('outputLatencyMs') ?? 0.0;
-      return value.isFinite && value > 0 ? value : 0.0;
+      return estimate.isFinite && estimate > 0 ? estimate : 0.0;
     } catch (_) {
       return 0.0;
     }
