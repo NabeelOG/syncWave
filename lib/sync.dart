@@ -116,7 +116,6 @@ class ClockSync {
     _own.add(rtt, offset);
   }
 }
-}
 
 /// Drift correction.
 ///
