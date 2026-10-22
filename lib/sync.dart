@@ -2,7 +2,7 @@ import 'dart:io';
 import 'dart:math';
 
 /// Shown in the UI so it is obvious when two phones run different builds.
-const String kAppVersion = '2.1.1';
+const String kAppVersion = '3.0.0';
 
 /// Monotonic clock (microsecond resolution, immune to wall-clock changes).
 class Monotonic {
@@ -92,90 +92,30 @@ class OffsetEstimator {
 ///     rtt    = (t4 - t1) - (t3 - t2)
 ///     offset = ((t2 - t1) + (t3 - t4)) / 2
 ///
-/// The estimate is biased by half the difference between the upstream and
-/// downstream delay, and that bias grows with the delay. To get rid of it the
-/// sync runs in *both* directions: the Host also pings this device and shares
-/// its own view of the offset. Whichever direction had the lower delay is the
-/// more trustworthy one and is used.
+/// The offset is measured with a burst at connect and then *held*. It is
+/// deliberately not updated afterwards: a clock offset that moves while the
+/// playback loop is trying to track it makes the loop chase a moving target,
+/// which shows up as the audio drifting in and out of sync. A constant offset
+/// of a millisecond or two is harmless - the playback loop corrects for it.
 class ClockSync {
   final OffsetEstimator _own = OffsetEstimator();
 
-  // The Host's view of the same offset, measured in the opposite direction.
-  double? _reverseDeltaMs;
-  double _reverseRttMs = 1e9;
-
-  // The offset actually in use. It is slewed towards the target estimate and
-  // never switched abruptly: this value feeds hostNowMs(), so a jump here
-  // would jump the expected playhead and make the phase error oscillate.
-  double _offsetMs = 0;
-  bool _hasOffset = false;
-
-  double get offsetMs => _offsetMs;
-
-  double get minRttMs {
-    if (_reverseDeltaMs != null && _reverseRttMs < _own.minRttMs) {
-      return _reverseRttMs;
-    }
-    return _own.minRttMs;
-  }
-
-  bool get locked => _hasOffset;
+  double get offsetMs => _own.offsetMs;
+  double get minRttMs => _own.minRttMs;
+  bool get locked => _own.hasSamples;
 
   /// Current time expressed on the Host's clock.
-  double hostNowMs() => Monotonic.nowMs() + _offsetMs;
+  double hostNowMs() => Monotonic.nowMs() + _own.offsetMs;
 
-  void reset() {
-    _own.reset();
-    _reverseDeltaMs = null;
-    _reverseRttMs = 1e9;
-    _offsetMs = 0;
-    _hasOffset = false;
-  }
+  void reset() => _own.reset();
 
   /// A sample measured by this device pinging the Host.
   void addSample(double t1, double t2, double t3, double t4) {
     final rtt = (t4 - t1) - (t3 - t2);
     final offset = ((t2 - t1) + (t3 - t4)) / 2.0;
     _own.add(rtt, offset);
-    _refreshOffset();
   }
-
-  /// The Host's estimate of the same offset, measured in the other direction.
-  void setReverse(double deltaMs, double rttMs) {
-    if (rttMs < 0 || rttMs > 1000) return;
-    _reverseDeltaMs = deltaMs;
-    _reverseRttMs = rttMs;
-    _refreshOffset();
-  }
-
-  /// Picks the most trustworthy estimate (the direction with the lower delay)
-  /// and moves the offset towards it smoothly.
-  void _refreshOffset() {
-    final double target = _pickTarget();
-    if (!_hasOffset) {
-      _offsetMs = target;
-      _hasOffset = true;
-      return;
-    }
-
-    final double delta = target - _offsetMs;
-    if (delta.abs() > 50) {
-      // More than 50 ms apart means the estimate was genuinely wrong (e.g. the
-      // network changed): accept it, otherwise followers would never recover.
-      _offsetMs = target;
-    } else {
-      // Slew: at most 5 ms per sample (samples arrive ~2 s apart).
-      _offsetMs += delta.clamp(-5.0, 5.0);
-    }
-  }
-
-  double _pickTarget() {
-    final own = _own.offsetMs;
-    if (_reverseDeltaMs != null && _reverseRttMs < _own.minRttMs) {
-      return _reverseDeltaMs!;
-    }
-    return own;
-  }
+}
 }
 
 /// Drift correction.
@@ -211,7 +151,7 @@ class ClockSync {
 ///   |error| <= deadband -> no phase term
 ///   > 300 ms            -> hard re-seek (stall, late join, ...)
 class Pll {
-  /// Phase errors below this are measurement noise, so the phase term is off.
+  /// Phase errors below this are measurement noise, so no correction is made.
   static const double deadbandMs = 2.0;
   static const double hardSeekMs = 300.0;
 
@@ -219,15 +159,13 @@ class Pll {
   static const double gain = 0.0006; // per ms of phase error
 
   /// Maximum speed change per control tick. Keeps the playback from stepping
-  /// (a step sounds like a click).
-  static const double maxSpeedStep = 0.0005; // 0.05%
+  /// (a step sounds like a click) while still converging in about a second.
+  static const double maxSpeedStep = 0.0015; // 0.15%
 
   /// Proportional correction for the given phase error (expected - actual, ms).
-  static double phaseTrim(double errorMs, {bool aggressive = false}) {
+  static double phaseTrim(double errorMs) {
     if (errorMs.abs() <= deadbandMs) return 0.0;
-    final double cap = aggressive ? 0.03 : maxTrim;
-    final double g = aggressive ? gain * 2.5 : gain;
-    return (g * errorMs).clamp(-cap, cap);
+    return (gain * errorMs).clamp(-maxTrim, maxTrim);
   }
 
   static bool needsHardSeek(double errorMs) => errorMs.abs() > hardSeekMs;

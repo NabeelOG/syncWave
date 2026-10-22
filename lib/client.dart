@@ -64,7 +64,6 @@ class _ClientScreenState extends State<ClientScreen> {
   double _lastErrorMs = 0;
 
   // Deadline until which the drift correction uses the stronger gain.
-  double _aggressiveUntilMs = 0;
 
   // Integral term of the drift controller and the sign of the previous error
   // (used to tell a real drift apart from measurement noise).
@@ -73,7 +72,6 @@ class _ClientScreenState extends State<ClientScreen> {
   // Rate matching: the base speed is trimmed so that this phone advances at
   // exactly the same rate as the host's playhead.
   double _baseSpeed = 1.0;
-  double _hostRate = 1.0;
   double _rateHostDelta = 0;
   double _rateClientDelta = 0;
   double _rateClockDelta = 0;
@@ -281,23 +279,14 @@ class _ClientScreenState extends State<ClientScreen> {
         break;
 
       case 'ping2':
-        // The host is measuring this phone's clock in the other direction.
-        // Answer with our receive/send timestamps so it can cancel the
-        // asymmetric delay of the uplink.
+        // Legacy: the host used to measure the clock in the other direction.
+        // Answer anyway so an older host still works.
         _ws?.add(jsonEncode({
           'type': 'pong2',
           't1h': msg['t1h'],
           't2c': t4,
           't3c': Monotonic.nowMs(),
         }));
-        break;
-
-      case 'clock':
-        // The host's own estimate of the clock offset.
-        _clock.setReverse(
-          (msg['deltaMs'] as num).toDouble(),
-          (msg['rttMs'] as num).toDouble(),
-        );
         break;
 
       case 'sync':
@@ -531,44 +520,33 @@ class _ClientScreenState extends State<ClientScreen> {
 
     // Proportional phase correction (a stable first order loop) on top of the
     // rate matched base speed (a feedforward).
-    final bool aggressive = Monotonic.nowMs() < _aggressiveUntilMs;
-    _applySpeed(
-      _baseSpeed + Pll.phaseTrim(_filteredErrorMs, aggressive: aggressive),
-    );
+    _applySpeed(_baseSpeed + Pll.phaseTrim(_filteredErrorMs));
   }
 
   /// Where the host's playhead is right now, extrapolated from the last
   /// position the host published.
   double _hostExpectedPosMs() {
     final double dt = _clock.hostNowMs() - _hostAnchorAtMs;
-    return _hostAnchorPosMs + dt * _hostRate;
+    return _hostAnchorPosMs + dt;
   }
 
-  /// The host published its playhead: remember it and use the window to
-  /// measure whether this phone advances at the same rate.
+  /// The host published its playhead: that is the reference this phone
+  /// follows. The message is used as-is - no smoothing, no slewing - because a
+  /// reference that moves under the playback loop makes the loop chase it.
   void _onHostSync(double hostPosMs, double hostAtMs) {
     final double clientPos = _position.positionMs;
 
-    final double clockDelta = hostAtMs - _hostAnchorAtMs;
-    final double hostDelta = hostPosMs - _hostAnchorPosMs;
-    final double clientDelta = clientPos - _hostAnchorClientPos;
-
-    if (clockDelta > 0) {
-      // The host's content rate relative to its own clock.
-      _hostRate = _hostRate * 0.8 + (hostDelta / clockDelta) * 0.2;
-    }
-
-    // Accumulate a longer window before trimming the base speed: measuring the
-    // rate over 500 ms is too noisy, over a few seconds it is clean.
-    _rateHostDelta += hostDelta;
-    _rateClientDelta += clientDelta;
-    _rateClockDelta += clockDelta;
+    // How far the host advanced, and how far this phone advanced, over the
+    // same window. Used for the rate feedforward below.
+    _rateHostDelta += hostPosMs - _hostAnchorPosMs;
+    _rateClientDelta += clientPos - _hostAnchorClientPos;
+    _rateClockDelta += hostAtMs - _hostAnchorAtMs;
 
     if (_rateClockDelta >= 3000 && _rateHostDelta > 500) {
       final double hostRate = _rateHostDelta / _rateClockDelta;
       final double clientRate = _rateClientDelta / _rateClockDelta;
       // Trim the base speed so both phones advance at the same rate. This is a
-      // feedforward, so it cannot fight the phase correction.
+      // slow feedforward, so it cannot fight the phase correction.
       _baseSpeed =
           (_baseSpeed - (clientRate - hostRate) * 0.3).clamp(0.97, 1.03);
       _rateHostDelta = 0;
@@ -576,24 +554,8 @@ class _ClientScreenState extends State<ClientScreen> {
       _rateClockDelta = 0;
     }
 
-    // Move our reference towards the host's playhead instead of snapping to
-    // it: a snapped reference would jump the phase error on every message.
-    final double measuredNow =
-        hostPosMs + (_clock.hostNowMs() - hostAtMs) * _hostRate;
-
-    if (_hostAnchorAtMs <= 0) {
-      _hostAnchorPosMs = measuredNow;
-      _hostAnchorAtMs = _clock.hostNowMs();
-    } else {
-      final double current = _hostExpectedPosMs();
-      final double diff = measuredNow - current;
-      // While playing, correct at most 10 ms per message (20 ms/s). Before
-      // playback starts there is nothing to hear, so snap immediately.
-      final double step = _playing ? 10.0 : 100000.0;
-      _hostAnchorPosMs = current + diff.clamp(-step, step);
-      _hostAnchorAtMs = _clock.hostNowMs();
-    }
-
+    _hostAnchorPosMs = hostPosMs;
+    _hostAnchorAtMs = hostAtMs;
     _hostAnchorClientPos = clientPos;
   }
 
@@ -616,15 +578,13 @@ class _ClientScreenState extends State<ClientScreen> {
     _hostAnchorAtMs = 0;
     _hostAnchorPosMs = 0;
     _hostAnchorClientPos = 0;
-    _hostRate = 1.0;
     _rateHostDelta = 0;
     _rateClientDelta = 0;
     _rateClockDelta = 0;
   }
 
-  /// Periodic (5 s) sync check. If this phone has drifted noticeably out of
-  /// phase it pulls in harder than the continuous loop so it locks on within
-  /// a couple of seconds instead of slowly creeping back.
+  /// Periodic (5 s) sanity check: if the phone is far out of phase, re-anchor
+  /// it. The continuous loop handles everything smaller than that.
   void _syncCheck() {
     if (!_playing || !_player.playing || !_ready) return;
     if (_hostAnchorAtMs <= 0) return;
@@ -645,15 +605,6 @@ class _ClientScreenState extends State<ClientScreen> {
           _player.setSpeed(1.0);
         }
       }
-      return;
-    }
-
-    if (error.abs() > Pll.deadbandMs * 2) {
-      // Pull in harder for the next few seconds so the phone locks on quickly.
-      _aggressiveUntilMs = Monotonic.nowMs() + 4000;
-      _applySpeed(
-        _baseSpeed + Pll.phaseTrim(_filteredErrorMs, aggressive: true),
-      );
     }
   }
 
@@ -889,7 +840,7 @@ class _ClientScreenState extends State<ClientScreen> {
         : '--';
     return Text(
       'clk ${_clock.offsetMs.toStringAsFixed(1)}ms  ·  rtt $rtt  ·  '
-      'rate ${_hostRate.toStringAsFixed(4)}  ·  v$kAppVersion',
+      'rate ${_baseSpeed.toStringAsFixed(4)}  ·  v$kAppVersion',
       style: const TextStyle(
         fontSize: 10,
         color: Colors.white30,

@@ -17,7 +17,6 @@ import 'sync.dart';
 
 class Peer {
   final WebSocket socket;
-  final OffsetEstimator reverse = OffsetEstimator();
   String name;
   String version;
   bool ready;
@@ -70,13 +69,11 @@ class _HostScreenState extends State<HostScreen> {
 
   Timer? _pll;
   Timer? _startTimer;
-  Timer? _clockPingTimer;
   Timer? _syncTimer;
   StreamSubscription<Duration>? _posSub;
   StreamSubscription<Duration?>? _durSub;
 
   // Filtered phase error used by the proportional correction.
-  double _filteredErrorMs = 0;
 
   @override
   void initState() {
@@ -116,19 +113,9 @@ class _HostScreenState extends State<HostScreen> {
         });
       }
 
-      // Probe every client's clock in the opposite direction so that both
-      // sides can pick the measurement with the lower delay (and therefore the
-      // smaller asymmetry bias).
-      _clockPingTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-        final double now = Monotonic.nowMs();
-        for (final peer in _peers.values) {
-          peer.socket.add(jsonEncode({'type': 'ping2', 't1h': now}));
-        }
-      });
-
       // Publish the actual playhead so the clients follow what this phone is
-      // really playing instead of a shared schedule. Without this the two
-      // controllers pull against each other.
+      // really playing. This is the only thing the clients need to stay in
+      // sync - no shared schedule, no clock games.
       _syncTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
         _broadcast({
           'type': 'sync',
@@ -205,27 +192,6 @@ class _HostScreenState extends State<HostScreen> {
           't1': msg['t1'],
           't2': t2,
           't3': Monotonic.nowMs(),
-        }));
-        break;
-
-      case 'pong2':
-        // The client answered our reverse-direction clock probe. Its own
-        // estimate of the offset is more trustworthy than ours when the
-        // reverse path was the faster one, so we hand it over.
-        final double t1h = (msg['t1h'] as num).toDouble();
-        final double t2c = (msg['t2c'] as num).toDouble();
-        final double t3c = (msg['t3c'] as num).toDouble();
-        final double t4h = Monotonic.nowMs();
-
-        final double rtt = (t4h - t1h) - (t3c - t2c);
-        // The host's view of (client clock - host clock).
-        final double offset = ((t2c - t1h) + (t3c - t4h)) / 2.0;
-        peer.reverse.add(rtt, offset);
-
-        peer.socket.add(jsonEncode({
-          'type': 'clock',
-          'deltaMs': -peer.reverse.offsetMs,
-          'rttMs': peer.reverse.minRttMs,
         }));
         break;
       case 'hello':
@@ -363,7 +329,6 @@ class _HostScreenState extends State<HostScreen> {
     });
 
     _startTimer?.cancel();
-    _filteredErrorMs = 0;
     setState(() {
       _playing = true;
       _startAtMs = startAt;
@@ -408,6 +373,8 @@ class _HostScreenState extends State<HostScreen> {
   }
 
   void _keepInSync() {
+    // The host is the reference: it does not chase anything, the clients
+    // follow the playhead it publishes. Only a real stall is corrected here.
     if (!_playing || !_player.playing) return;
     final double elapsed = (Monotonic.nowMs() - _startAtMs) / 1000.0;
     if (elapsed < 0.5) return;
@@ -415,27 +382,14 @@ class _HostScreenState extends State<HostScreen> {
     final double expected = (_startPosSec + elapsed) * 1000.0;
     final double error = expected - _position.positionMs;
 
-    // Hard seeks are audible: only use them for a real desync and rate-limit
-    // them so the audio never turns into chopping.
-    final double now = Monotonic.nowMs();
     if (Pll.needsHardSeek(error)) {
+      final double now = Monotonic.nowMs();
       if (now - _lastSeekAtMs > 2000) {
         _lastSeekAtMs = now;
         _player.seek(Duration(milliseconds: expected.round()));
         _position.reset(expected);
-        if (_speed != 1.0) {
-          _speed = 1.0;
-          _position.setSpeed(1.0);
-          _player.setSpeed(1.0);
-        }
       }
-      return;
     }
-
-    // Proportional phase correction only - a P loop on a position plant is
-    // stable and cannot ring.
-    _filteredErrorMs = _filteredErrorMs * 0.7 + error * 0.3;
-    _applySpeed(1.0 + Pll.phaseTrim(_filteredErrorMs));
   }
 
   /// Applies a target speed, but never changes it by more than
@@ -460,7 +414,6 @@ class _HostScreenState extends State<HostScreen> {
   void dispose() {
     _pll?.cancel();
     _startTimer?.cancel();
-    _clockPingTimer?.cancel();
     _syncTimer?.cancel();
     _posSub?.cancel();
     _durSub?.cancel();

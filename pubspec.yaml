@@ -1,7 +1,7 @@
 name: syncwave
 description: Play one MP3 on many phones at the same time over Wi-Fi.
 publish_to: "none"
-version: 2.1.1+5
+version: 3.0.0+6
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
